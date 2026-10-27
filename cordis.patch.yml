@@ -1,0 +1,19 @@
+# DSH Data Sync — bundle layer.
+#
+# The patch lists the portable defaults. Everything the Settings page changes is
+# written to `$DSH_HOME/dsh-data-sync/config.json` instead, so the UI never has
+# to rewrite this file and the profile patch stays readable.
+- insert:
+    - id: data-sync
+      name: '@local/dsh-data-sync'
+      config:
+        repoUrl: ''
+        branch: main
+        sources:
+          config: true
+          memory: true
+          skills: true
+        keepSnapshots: 10
+        autoBackup:
+          enabled: false
+          intervalHours: 24

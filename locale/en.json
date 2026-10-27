@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Data Sync",
+    "description": "Move a DeepSeek Harness installation between machines: snapshot the profile configuration, the long-term memory store and the skills into a private git repository, restore them with absolute-path remapping, and keep a local backup rotation plus a scheduled automatic backup."
+  }
+}
