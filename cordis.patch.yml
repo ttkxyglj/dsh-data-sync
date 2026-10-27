@@ -17,3 +17,8 @@
         autoBackup:
           enabled: false
           intervalHours: 24
+        # Keep three days of remote versions and always keep the newest one; older
+        # snapshots are pruned from the branch history after a successful push.
+        remoteRetention:
+          enabled: true
+          days: 3

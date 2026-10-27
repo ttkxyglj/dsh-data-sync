@@ -132,6 +132,12 @@ window.__ModuleLoader__.load({
       hideFiles: 'Hide files',
       notPulled: 'Nothing was written',
       rollbackSkipped: 'not restored',
+      memoryDirPlaceholder: 'Detected automatically — leave empty to detect again',
+      memoryDirHint: 'This is the storage directory of the memory plugin (memories.json + MEMORY.md), not another copy: it must point at the real store. Leave it empty to detect it from the installed memory plugin; a configured path that no longer exists is replaced by the detected one.',
+      retentionEnable: 'Keep only recent remote versions',
+      retentionDays: 'Days to keep',
+      retentionHint: 'After a successful push, snapshots older than this window are removed from the remote branch. The newest snapshot is always kept, even when it is itself older than the window. Other machines pick up the shorter history on their next pull.',
+      retentionLast: 'Last prune: {when} — removed {count} snapshot(s), window {days} day(s)',
     }
 
     const zh = {
@@ -247,6 +253,12 @@ window.__ModuleLoader__.load({
       hideFiles: '收起文件',
       notPulled: '没有写入任何文件',
       rollbackSkipped: '未能恢复',
+      memoryDirPlaceholder: '自动探测——留空表示重新探测',
+      memoryDirHint: '这里就是记忆插件的存储目录（memories.json + MEMORY.md），不是另存一份：必须指向真实位置。留空会从已安装的记忆插件自动探测；已保存的路径如果不存在，会改用探测到的位置。',
+      retentionEnable: '只保留最近若干天的远端版本',
+      retentionDays: '保留天数',
+      retentionHint: '推送成功后，早于这个天数的快照会从远端分支里删除；最新的那一版始终保留，即使它本身已经超过天数。其它机器下次拉取时会拿到变短的历史。',
+      retentionLast: '上次清理：{when}，删除 {count} 版，保留窗口 {days} 天',
     }
 
     /** Active locale code, read from the Client locale service when available. */
@@ -426,6 +438,7 @@ window.__ModuleLoader__.load({
         sources: { config: true, memory: true, skills: true },
         memoryDir: '', workspaceRoots: [], pathMappings: [], keepSnapshots: 10,
         autoBackup: { enabled: false, intervalHours: 24 },
+        remoteRetention: { enabled: true, days: 3 },
       })
       const dirtyRef = React.useRef(false)
       const form = formState
@@ -472,6 +485,9 @@ window.__ModuleLoader__.load({
               pathMappings: Array.isArray(data.pathMappings) ? data.pathMappings.slice() : [],
               keepSnapshots: data.keepSnapshots || 10,
               autoBackup: data.autoBackup || { enabled: false, intervalHours: 24 },
+              remoteRetention: data.remoteRetention
+                ? { enabled: data.remoteRetention.enabled !== false, days: data.remoteRetention.days || 3 }
+                : { enabled: true, days: 3 },
             })
           }
           setLoadError('')
@@ -747,9 +763,11 @@ window.__ModuleLoader__.load({
             className: 'dsh-sync-input',
             type: 'text',
             value: form.memoryDir,
+            placeholder: t('memoryDirPlaceholder'),
             disabled,
             onChange: (event) => setForm({ ...form, memoryDir: event.target.value }),
           }),
+          h('p', { className: 'dsh-sync-hint' }, t('memoryDirHint')),
         ),
         h('div', { className: 'dsh-sync-field' },
           h('span', { className: 'dsh-sync-label' }, t('workspaceRoots')),
@@ -901,7 +919,9 @@ window.__ModuleLoader__.load({
         : {}
       const planBlock = plan
         ? h('div', { className: 'dsh-sync-field' },
-            h('p', { className: 'dsh-sync-note' }, plan.remoteSnapshotId ? t('remoteSnapshot', { id: plan.remoteSnapshotId }) : t('planEmpty')),
+            h('p', { className: 'dsh-sync-note' }, plan.remoteSnapshotId
+              ? `${t('remoteSnapshot', { id: plan.remoteSnapshotId })}${plan.remoteCreatedAt ? ` · ${formatTime(plan.remoteCreatedAt)}` : ''}`
+              : t('planEmpty')),
             plan.actions.length > 0
               ? h('p', { className: 'dsh-sync-hint' }, `${t('planAdd', { count: planCounts.add || 0 })} · ${t('planUpdate', { count: planCounts.update || 0 })} · ${t('planSame', { count: planCounts.same || 0 })}`)
               : null,
@@ -1041,6 +1061,35 @@ window.__ModuleLoader__.load({
           : null,
         current.autoBackup && current.autoBackup.lastError
           ? h('p', { className: 'dsh-sync-error' }, t('scheduleError', { message: current.autoBackup.lastError }))
+          : null,
+        h('label', { className: 'dsh-sync-check' },
+          h('input', {
+            type: 'checkbox',
+            checked: Boolean(form.remoteRetention && form.remoteRetention.enabled),
+            disabled,
+            onChange: (event) => setForm({ ...form, remoteRetention: { ...(form.remoteRetention || {}), enabled: event.target.checked } }),
+          }),
+          h('span', null, t('retentionEnable')),
+        ),
+        h('label', { className: 'dsh-sync-field' },
+          h('span', { className: 'dsh-sync-label' }, t('retentionDays')),
+          h('input', {
+            className: 'dsh-sync-input',
+            type: 'number',
+            min: 1,
+            max: 365,
+            value: form.remoteRetention && form.remoteRetention.days ? form.remoteRetention.days : 3,
+            disabled,
+            onChange: (event) => setForm({ ...form, remoteRetention: { ...(form.remoteRetention || {}), days: Number(event.target.value) || 3 } }),
+          }),
+        ),
+        h('p', { className: 'dsh-sync-hint' }, t('retentionHint')),
+        current.remoteRetention && current.remoteRetention.last
+          ? h('p', { className: 'dsh-sync-hint' }, t('retentionLast', {
+              when: formatTime(current.remoteRetention.last.at),
+              count: current.remoteRetention.last.pruned,
+              days: current.remoteRetention.last.days,
+            }))
           : null,
         h('div', { className: 'dsh-sync-actions' },
           h('button', { type: 'button', className: 'dsh-sync-btn dsh-sync-btn-primary', disabled, onClick: () => void save() }, t('saveConfig')),

@@ -35,7 +35,9 @@ import {
   commitAndPush,
   createPrivateRepo,
   ensureRepo,
+  fetchRemote,
   gitLog,
+  pruneRemoteHistory,
   repoState,
   resetToRemote,
   verifyRepoPrivate,
@@ -93,7 +95,10 @@ async function bundlePatchFiles(dshHome, profile) {
       return
     }
     for (const entry of entries) {
-      if (!entry.isDirectory()) continue
+      // `link:` installs are directory symlinks/junctions on Windows, and
+      // Dirent.isDirectory() is false for them — which is exactly how the memory
+      // plugin is installed on this machine.
+      if (!entry.isDirectory() && !entry.isSymbolicLink()) continue
       if (entry.name.startsWith('.')) continue
       if (entry.name.startsWith('@')) {
         let scoped = []
@@ -103,7 +108,7 @@ async function bundlePatchFiles(dshHome, profile) {
           continue
         }
         for (const inner of scoped) {
-          if (inner.isDirectory()) files.push(path.join(dir, entry.name, inner.name, 'cordis.patch.yml'))
+          if (inner.isDirectory() || inner.isSymbolicLink()) files.push(path.join(dir, entry.name, inner.name, 'cordis.patch.yml'))
         }
       } else {
         files.push(path.join(dir, entry.name, 'cordis.patch.yml'))
@@ -195,7 +200,18 @@ function createRuntime(rawConfig) {
       const patchMemoryDir = rawConfig && typeof rawConfig === 'object' && typeof rawConfig.memoryDir === 'string' ? rawConfig.memoryDir.trim() : ''
       const savedMemoryDir = saved && typeof saved.memoryDir === 'string' ? saved.memoryDir.trim() : ''
       cfg = mergeSaved(cfg, saved)
-      if (patchMemoryDir === '' && savedMemoryDir === '') cfg.memoryDir = await detectMemoryDir(cfg)
+      if (patchMemoryDir === '') {
+        const detected = await detectMemoryDir(cfg)
+        // A saved path that no longer exists (or is the portable fallback) must not
+        // win over a memory store that is actually present: on this machine the
+        // bundle patch says D:\dsh-memory while an older save stored the fallback.
+        if (detected !== '' && detected !== cfg.memoryDir && !exists(cfg.memoryDir)) {
+          await log.append('info', `memory directory resolved to ${detected} (configured ${cfg.memoryDir} does not exist)`)
+          cfg.memoryDir = detected
+        } else if (savedMemoryDir === '' && detected !== '') {
+          cfg.memoryDir = detected
+        }
+      }
       return cfg
     })()
     return readyPromise
@@ -225,7 +241,11 @@ function createRuntime(rawConfig) {
     if (typeof input.branch === 'string' && input.branch.trim() !== '') next.branch = input.branch.trim()
     if (typeof input.profile === 'string' && input.profile.trim() !== '') next.profile = input.profile.trim()
     if (typeof input.deviceName === 'string' && input.deviceName.trim() !== '') next.deviceName = input.deviceName.trim()
-    if (typeof input.memoryDir === 'string' && input.memoryDir.trim() !== '') next.memoryDir = path.resolve(input.memoryDir.trim())
+    if (typeof input.memoryDir === 'string') {
+      const value = input.memoryDir.trim()
+      // An empty value means "detect it again" rather than "keep the old one".
+      next.memoryDir = value === '' ? '' : path.resolve(value)
+    }
     if (input.sources && typeof input.sources === 'object') {
       next.sources = {
         config: typeof input.sources.config === 'boolean' ? input.sources.config : cfg.sources.config,
@@ -244,6 +264,12 @@ function createRuntime(rawConfig) {
       next.autoBackup = {
         enabled: typeof input.autoBackup.enabled === 'boolean' ? input.autoBackup.enabled : cfg.autoBackup.enabled,
         intervalHours: clampInt(input.autoBackup.intervalHours, cfg.autoBackup.intervalHours, 1, 24 * 30),
+      }
+    }
+    if (input.remoteRetention && typeof input.remoteRetention === 'object') {
+      next.remoteRetention = {
+        enabled: typeof input.remoteRetention.enabled === 'boolean' ? input.remoteRetention.enabled : cfg.remoteRetention.enabled,
+        days: clampInt(input.remoteRetention.days, cfg.remoteRetention.days, 1, 365),
       }
     }
     if (typeof input.allowSecrets === 'boolean') next.allowSecrets = input.allowSecrets
@@ -280,6 +306,37 @@ function createRuntime(rawConfig) {
     } catch (error) {
       if (error && error.code === 'PUBLIC_REPO') throw error
       return { isPrivate: false, verified: false, error: messageOf(error) }
+    }
+  }
+
+  /** Prune remote snapshots older than the retention window (newest always kept). */
+  async function applyRetention(token) {
+    const warnings = []
+    if (!cfg.remoteRetention.enabled || cfg.repoUrl === '') return { warnings, pruned: 0, head: '' }
+    // Back-to-back pushes (auto backup plus a manual one) should not pay for a
+    // fetch and a history scan each time.
+    const st = await state.read()
+    const lastAt = st.lastRetention && Number.isFinite(st.lastRetention.at) ? st.lastRetention.at : 0
+    if (lastAt > 0 && Date.now() - lastAt < 10 * 60 * 1000) return { warnings, pruned: 0, head: '' }
+    try {
+      const result = await pruneRemoteHistory(cfg, token, { days: cfg.remoteRetention.days })
+      if (result.pruned > 0) {
+        const ids = result.snapshotIds.length > 0 ? ` (${result.snapshotIds.slice(0, 5).join(', ')})` : ''
+        warnings.push(`remote retention: removed ${result.pruned} snapshot(s) older than ${cfg.remoteRetention.days} day(s)${ids}; the newest one is always kept`)
+        await log.append('info', `retention: pruned ${result.pruned} remote snapshot(s), kept ${result.kept}`)
+        await state.patch({
+          lastRetention: { at: Date.now(), pruned: result.pruned, kept: result.kept, days: cfg.remoteRetention.days, head: result.head },
+        })
+      } else if (result.error) {
+        warnings.push(`remote retention could not prune: ${result.error} — nothing was deleted`)
+      }
+      if (result.pruned === 0) {
+        await state.patch({ lastRetention: { at: Date.now(), pruned: 0, kept: result.kept, days: cfg.remoteRetention.days, head: result.head } })
+      }
+      return { warnings, pruned: result.pruned, head: result.head }
+    } catch (error) {
+      warnings.push(`remote retention failed: ${messageOf(error)} — nothing was deleted`)
+      return { warnings, pruned: 0, head: '' }
     }
   }
 
@@ -333,6 +390,11 @@ function createRuntime(rawConfig) {
           nextAt: cfg.autoBackup.enabled && cfg.repoUrl !== '' ? (lastRun > 0 ? lastRun + interval : Date.now() + interval) : 0,
           lastError: (st.autoBackup && st.autoBackup.lastError) || '',
         },
+        remoteRetention: {
+          enabled: cfg.remoteRetention.enabled,
+          days: cfg.remoteRetention.days,
+          last: st.lastRetention || null,
+        },
         tokenPresent: token !== '',
         lastPush: st.lastPush || null,
         lastPull: st.lastPull || null,
@@ -350,10 +412,19 @@ function createRuntime(rawConfig) {
       return await exclusive(async () => {
         const previousRepo = cfg.repoUrl
         const previousBranch = cfg.branch
+        const previousRetention = cfg.remoteRetention
         await saveConfig(request)
         // A different remote or branch makes the cached ahead/behind counters a
         // statement about a repository this machine no longer tracks.
         if (cfg.repoUrl !== previousRepo || cfg.branch !== previousBranch) await state.patch({ remote: null })
+        // A changed retention window must take effect on the next push instead of
+        // waiting for the debounce to expire.
+        if (
+          cfg.remoteRetention.enabled !== previousRetention.enabled ||
+          cfg.remoteRetention.days !== previousRetention.days
+        ) {
+          await state.patch({ lastRetention: null })
+        }
         return await service.status({})
       })
     },
@@ -436,8 +507,10 @@ function createRuntime(rawConfig) {
         const sameBootstrap = Boolean(existing) && typeof existing.bootstrapDigest === 'string' && existing.bootstrapDigest === bootstrap
         if (samePayload && sameBootstrap && repo.clean && repo.ahead === 0) {
           const unchangedId = existing.snapshotId || snapshotId
+          // No new snapshot, but the retention window may still have expired.
+          const retention = await applyRetention(token)
           await state.patch({
-            lastPush: { at: Date.now(), snapshotId: unchangedId, commit: repo.head, count: collected.count, bytes: collected.bytes },
+            lastPush: { at: Date.now(), snapshotId: unchangedId, commit: retention.head || repo.head, count: collected.count, bytes: collected.bytes },
           })
           await log.append('info', `push skipped: payload and plugin copy unchanged since ${unchangedId}`)
           return {
@@ -449,7 +522,7 @@ function createRuntime(rawConfig) {
             upToDate: true,
             dryRun: false,
             durationMs: Date.now() - started,
-            warnings: [...baseWarnings, 'payload and plugin copy unchanged — no commit was created'],
+            warnings: [...baseWarnings, 'payload and plugin copy unchanged — no commit was created', ...retention.warnings],
             secretFindings: findings,
           }
         }
@@ -464,13 +537,14 @@ function createRuntime(rawConfig) {
           remote: { checkedAt: Date.now(), ahead: 0, behind: 0, headCommit: result.commit, error: '' },
         })
         await log.append('info', `push ${snapshotId}: ${collected.count} files, ${humanBytes(collected.bytes)}, commit ${result.commit || 'none'}`)
-        const warnings = [...baseWarnings, ...writeWarnings]
+        const retention = await applyRetention(token)
+        const warnings = [...baseWarnings, ...writeWarnings, ...retention.warnings]
         if (!branchExists && !cloned) warnings.push(`created a new local branch "${cfg.branch}"; confirm the remote branch name matches`)
         return {
           snapshotId,
           count: collected.count,
           bytes: collected.bytes,
-          commit: result.commit,
+          commit: retention.pruned > 0 ? retention.head || result.commit : result.commit,
           pushed: result.pushed,
           upToDate: result.upToDate,
           dryRun: false,
@@ -636,6 +710,8 @@ function createRuntime(rawConfig) {
       if (!exists(path.join(cfg.repoDir, '.git'))) return { commits: [], error: 'the repository has not been cloned on this machine yet' }
       try {
         const token = await currentToken()
+        // Another machine may have pruned or pushed since this clone was made.
+        await fetchRemote(cfg, token).catch(() => {})
         const commits = await gitLog(cfg, token, clampInt(input.limit, 20, 1, 100))
         return { commits, error: '' }
       } catch (error) {
@@ -773,7 +849,10 @@ export const remoteContribution = {
 const GUIDANCE = [
   '## DSH data sync (this machine)',
   '- A `@local/dsh-data-sync` plugin can snapshot this harness (profile config, memory store, skills) into a private git repository and restore it on another machine with absolute paths remapped.',
-  '- Use `data_sync_status` before claiming anything about the sync state; `data_sync_push` writes a snapshot, `data_sync_pull` (apply: false) only previews what a pull would change, and `data_sync_pull` with a `commit` applies an older snapshot from the remote history.',
+  '- Use `data_sync_status` before claiming anything about the sync state; `data_sync_push` writes a snapshot, `data_sync_pull` (apply: false) only previews what a pull would change.',
+  '- `data_sync_pull` without `commit` applies the newest snapshot on the branch (for example the version pushed today); `data_sync_pull` with a `commit` from `data_sync_history` applies an older version instead.',
+  '- The `memoryDir` of this plugin is the storage directory of the memory plugin (its `storageDir`: `memories.json` + `MEMORY.md`), not a second copy. Never point it somewhere else; leave it empty to detect it from the installed memory plugin.',
+  '- Remote retention is on by default (3 days): a successful push prunes snapshots older than the window from the branch and always keeps the newest one. Set `remoteRetention` through `data_sync_configure` to change it.',
   '- Never invent a repository URL or token, and never enable "allow secrets": the snapshot deliberately excludes credentials.',
 ].join('\n')
 
@@ -925,6 +1004,15 @@ export function apply(ctx, rawConfig) {
             },
             additionalProperties: false,
           },
+          remoteRetention: {
+            type: 'object',
+            description: 'How many days of remote versions to keep. After a successful push, older snapshots are pruned from the branch history; the newest is always kept.',
+            properties: {
+              enabled: { type: 'boolean', description: 'Default true.' },
+              days: { type: 'integer', minimum: 1, maximum: 365, description: 'Default 3.' },
+            },
+            additionalProperties: false,
+          },
         },
         additionalProperties: false,
       },
@@ -940,7 +1028,7 @@ export function apply(ctx, rawConfig) {
     ctx.tools.register({
       name: 'data_sync_push',
       description:
-        'Snapshot this machine (configuration, memory, skills per the configured sources) into the private repository and push a commit. Refuses to push when the secret screen finds a credential-shaped value. Pass `dryRun: true` to see what would travel without touching git. Use it on the machine being left, before wiping it.',
+        'Snapshot this machine (configuration, memory, skills per the configured sources) into the private repository and push a commit. Refuses to push when the secret screen finds a credential-shaped value. After a successful push, snapshots older than the retention window are pruned from the remote branch (the newest is always kept). Pass `dryRun: true` to see what would travel without touching git. Use it on the machine being left, before wiping it.',
       parameters: {
         type: 'object',
         properties: {
@@ -961,7 +1049,7 @@ export function apply(ctx, rawConfig) {
     ctx.tools.register({
       name: 'data_sync_pull',
       description:
-        'Apply the snapshot in the private repository to this machine, with the recorded absolute paths remapped to local paths. `apply: false` (the default) only previews the plan: per-file add/update/same and the mapping table. A real apply takes a local backup first; `backupId` names it for a rollback. Pass `commit` to apply an older snapshot from the remote history instead of the branch head. Use it on the new machine after installing the plugin and connecting the repository.',
+        'Apply the snapshot in the private repository to this machine, with the recorded absolute paths remapped to local paths. Without `commit` it applies the newest snapshot on the branch — "the version pushed today" after today\'s push. `apply: false` (the default) only previews the plan: per-file add/update/same, the remote snapshot id and the mapping table. A real apply takes a local backup first; `backupId` names it for a rollback. Pass `commit` (from data_sync_history) to apply an older snapshot instead. Use it on the new machine after installing the plugin and connecting the repository.',
       parameters: {
         type: 'object',
         properties: {

@@ -1,5 +1,59 @@
 # Changelog
 
+## 0.4.0 — 2026-10-27
+
+### Added — remote retention (keep three days, always keep the newest)
+
+- After a successful push, snapshots older than `remoteRetention.days` (default 3) are
+  removed from the remote branch. Each commit is a full snapshot, so this is a history
+  rewrite: the retained trees are replayed with `commit-tree` and the branch is
+  force-pushed with `--force-with-lease`. **The newest snapshot is always kept**, even if
+  it is itself older than the window.
+- The rewrite is all-or-nothing: a rejected force push (protected branch, or another
+  machine pushed in between) resets the local branch and reports it instead of leaving the
+  clone rewritten. Local objects are reclaimed with `reflog expire` + `gc --prune=now`.
+- Configurable in Settings (enable + days) and through `data_sync_configure`
+  (`remoteRetention`); `status` reports the window and the last prune.
+  *(`remote retention drops snapshots older than the window and keeps the newest`)*
+
+### Added — restore a specific version on another machine
+
+- `pull` without `commit` applies the newest snapshot (today's push); the Settings history
+  list applies any older version with an inline confirm. The plan now shows the remote
+  snapshot id **and its timestamp**, so the version being applied is unambiguous.
+  *(`a second machine pulls the newest pushed snapshot, or an older one by commit`)*
+
+### Fixed — the memory directory shown in Settings was wrong
+
+- `memoryDir` is the storage directory of the memory plugin (`memories.json` +
+  `MEMORY.md`) — on this machine `D:\dsh-memory` — but the page showed
+  `$DSH_HOME\storages\memory`. Three causes, all fixed:
+  1. 0.3.0's detector only replaced the value when nothing had been saved, and an
+     older save had persisted the fallback path, which then always won;
+  2. `link:` installs are directory **junctions** on Windows and
+     `Dirent.isDirectory()` is false for them, so the memory plugin's own bundle
+     patch was never scanned (this machine installs it that way);
+  3. an empty input meant "keep the old value" instead of "detect again".
+  A configured path that does not exist is now replaced by the detected one, and
+  `memoryDir: ''` triggers detection. Live check on the real machine: the plugin now
+  resolves `D:\dsh-memory` and the preview carries 2 memory files (~197 KiB of the
+  201 KiB payload) instead of none.
+  *(`a linked bundle patch is scanned for the memory directory`,
+  `a stale saved memory directory is replaced by the detected one`)*
+- Proof of the old behaviour: the snapshot pushed at 22:15 contained 5 configuration files
+  and no `memories.json`/`MEMORY.md`; after this fix the next push carries them.
+
+### Fixed — retention interaction details
+
+- Retention runs at most once every ten minutes per machine, so a manual push right after an
+  automatic one does not pay for another fetch and history scan; changing the window in
+  Settings resets that debounce so the next push applies it.
+- A push whose payload is unchanged still runs retention (`upToDate: true` no longer
+  freezes an old history).
+- `history()` fetches before reading, so a prune made by another machine is visible.
+- `push` reports the new head hash after a prune, and retention failures are warnings,
+  never a failed push.
+
 ## 0.3.0 — 2026-10-27
 
 An independent audit of 0.2.0 found a theme the first two passes had missed: where the
