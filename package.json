@@ -1,10 +1,11 @@
 {
   "name": "@local/dsh-data-sync",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "Move a DeepSeek Harness installation between machines: snapshot the profile configuration, the long-term memory store and the skills into a private git repository, restore them with absolute-path remapping, and keep a local backup rotation plus a scheduled automatic backup.",
   "license": "MIT",
+  "author": "Erji Gao",
   "keywords": [
     "deepseek-harness",
     "dsh",
@@ -27,7 +28,9 @@
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE"
   ],
   "dsh": {
     "bundle": {

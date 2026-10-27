@@ -117,6 +117,21 @@ window.__ModuleLoader__.load({
       action_add: 'add',
       action_update: 'update',
       action_same: 'unchanged',
+      mappingsTitle: 'Path rewrites',
+      mappingsHint: 'Recorded automatically for the home, profile, memory and workspace paths. Add your own rules for other absolute paths (drive letters, user names, mount points); they travel with the snapshot.',
+      mappingFrom: 'Old path',
+      mappingTo: 'New path',
+      addMapping: 'Add rewrite',
+      pathFromPlaceholder: 'D:\\old\\path',
+      pathToPlaceholder: 'E:\\new\\path',
+      applyCommit: 'Apply this version',
+      confirmCommit: 'Restore snapshot {id}? A backup of this machine is taken first, and files the snapshot does not contain are left alone.',
+      commitApplied: 'Restored {id}: {added} new, {updated} updated',
+      fileListTitle: 'Files in this snapshot',
+      showFiles: 'Show files',
+      hideFiles: 'Hide files',
+      notPulled: 'Nothing was written',
+      rollbackSkipped: 'not restored',
     }
 
     const zh = {
@@ -217,6 +232,21 @@ window.__ModuleLoader__.load({
       action_add: '新增',
       action_update: '更新',
       action_same: '不变',
+      mappingsTitle: '路径改写',
+      mappingsHint: '主目录、配置档、记忆目录和工作区路径会自动记录；其它绝对路径（盘符、用户名、挂载点）可以在这里补规则，规则会随快照一起走。',
+      mappingFrom: '旧路径',
+      mappingTo: '新路径',
+      addMapping: '添加规则',
+      pathFromPlaceholder: 'D:\\old\\path',
+      pathToPlaceholder: 'E:\\new\\path',
+      applyCommit: '应用此版本',
+      confirmCommit: '恢复快照 {id}？会先备份本机，且不会删除快照里没有的文件。',
+      commitApplied: '已恢复 {id}：新增 {added}，更新 {updated}',
+      fileListTitle: '本快照包含的文件',
+      showFiles: '查看文件',
+      hideFiles: '收起文件',
+      notPulled: '没有写入任何文件',
+      rollbackSkipped: '未能恢复',
     }
 
     /** Active locale code, read from the Client locale service when available. */
@@ -386,44 +416,64 @@ window.__ModuleLoader__.load({
       const [status, setStatus] = React.useState(null)
       const [loadError, setLoadError] = React.useState('')
       const [busy, setBusy] = React.useState('')
+      const [refreshing, setRefreshing] = React.useState(false)
       const [error, setError] = React.useState('')
       const [notice, setNotice] = React.useState('')
 
-      const [form, setForm] = React.useState({
+      const [warnings, setWarnings] = React.useState([])
+      const [formState, setFormState] = React.useState({
         repoUrl: '', branch: 'main', token: '', tokenClear: false,
         sources: { config: true, memory: true, skills: true },
-        memoryDir: '', workspaceRoots: [], keepSnapshots: 10,
+        memoryDir: '', workspaceRoots: [], pathMappings: [], keepSnapshots: 10,
         autoBackup: { enabled: false, intervalHours: 24 },
       })
+      const dirtyRef = React.useRef(false)
+      const form = formState
+      // Every edit marks the form dirty, so the 60-second refresh cannot overwrite
+      // a value the user is typing (or a "clear token" checkbox they just ticked).
+      const setForm = (next) => {
+        dirtyRef.current = true
+        setFormState(next)
+      }
       const [preview, setPreview] = React.useState(null)
+      const [showFiles, setShowFiles] = React.useState(false)
       const [plan, setPlan] = React.useState(null)
       const [confirmApply, setConfirmApply] = React.useState(false)
       const [backups, setBackups] = React.useState(null)
       const [history, setHistory] = React.useState(null)
       const [confirmRollback, setConfirmRollback] = React.useState('')
+      const [confirmCommit, setConfirmCommit] = React.useState('')
       const [showLog, setShowLog] = React.useState(false)
 
-      const locale = React.useRef('zh')
       const seq = React.useRef(0)
+      const busyRef = React.useRef('')
+      const statusRef = React.useRef(null)
 
       const load = React.useCallback(async () => {
         const current = ++seq.current
-        setBusy('load')
+        setRefreshing(true)
         try {
           const data = await api.status({})
           if (current !== seq.current) return
           setStatus(data)
-          setForm({
-            repoUrl: data.repoUrl || '',
-            branch: data.branch || 'main',
-            token: '',
-            tokenClear: false,
-            sources: data.sources || { config: true, memory: true, skills: true },
-            memoryDir: data.memoryDir || '',
-            workspaceRoots: Array.isArray(data.workspaceRoots) ? data.workspaceRoots.slice() : [],
-            keepSnapshots: data.keepSnapshots || 10,
-            autoBackup: data.autoBackup || { enabled: false, intervalHours: 24 },
-          })
+          statusRef.current = data
+          setWarnings(Array.isArray(data.warnings) ? data.warnings : [])
+          // A dirty form is the user's work in progress: a background refresh must
+          // not reset it, and tokenClear/token always survive a refresh.
+          if (!dirtyRef.current) {
+            setFormState({
+              repoUrl: data.repoUrl || '',
+              branch: data.branch || 'main',
+              token: '',
+              tokenClear: false,
+              sources: data.sources || { config: true, memory: true, skills: true },
+              memoryDir: data.memoryDir || '',
+              workspaceRoots: Array.isArray(data.workspaceRoots) ? data.workspaceRoots.slice() : [],
+              pathMappings: Array.isArray(data.pathMappings) ? data.pathMappings.slice() : [],
+              keepSnapshots: data.keepSnapshots || 10,
+              autoBackup: data.autoBackup || { enabled: false, intervalHours: 24 },
+            })
+          }
           setLoadError('')
           setStage('ready')
           if (data.configured) {
@@ -432,12 +482,18 @@ window.__ModuleLoader__.load({
           }
         } catch (caught) {
           if (current !== seq.current) return
-          setLoadError(errorMessage(caught))
-          setStage('failed')
+          // A refresh that fails after the page is up must say so; the failure page
+          // is only for the first load.
+          const message = errorMessage(caught)
+          if (statusRef.current) setError(t('loadFailed', { message }))
+          else {
+            setLoadError(message)
+            setStage('failed')
+          }
         } finally {
-          if (current === seq.current) setBusy('')
+          if (current === seq.current) setRefreshing(false)
         }
-      }, [api])
+      }, [api, t])
 
       React.useEffect(() => {
         void load()
@@ -445,16 +501,20 @@ window.__ModuleLoader__.load({
 
       React.useEffect(() => {
         const timer = setInterval(() => {
-          if (document.visibilityState !== 'hidden') void load()
+          // Never clobber a running action: a refresh that lands mid-push would
+          // re-enable buttons the action has disabled.
+          if (document.visibilityState !== 'hidden' && busyRef.current === '') void load()
         }, 60000)
         return () => clearInterval(timer)
       }, [load])
 
       const run = React.useCallback(
         async (key, task, success) => {
+          busyRef.current = key
           setBusy(key)
           setError('')
           setNotice('')
+          setWarnings([])
           try {
             const result = await task()
             if (typeof success === 'function') success(result)
@@ -463,6 +523,7 @@ window.__ModuleLoader__.load({
             setError(errorMessage(caught))
             return null
           } finally {
+            busyRef.current = ''
             setBusy('')
           }
         },
@@ -471,7 +532,10 @@ window.__ModuleLoader__.load({
 
       const save = () => run('save', () => api.saveConfig(form), (data) => {
         setStatus(data)
+        setPreview(null)
+        setPlan(null)
         setNotice(t('saved'))
+        dirtyRef.current = false
       })
 
       const connect = async () => {
@@ -479,27 +543,46 @@ window.__ModuleLoader__.load({
         if (!saved) return
         await run('connect', () => api.init({ repoUrl: saved.repoUrl, branch: saved.branch }), (result) => {
           setNotice(`${result.repoUrl} (${result.branch})`)
+          setWarnings(Array.isArray(result.warnings) ? result.warnings : [])
+          dirtyRef.current = false
           void load()
         })
       }
 
-      const doPreview = () => run('preview', () => api.preview(), (data) => setPreview(data))
+      const doPreview = () => run('preview', () => api.preview(), (data) => {
+        setPreview(data)
+        setWarnings(Array.isArray(data.warnings) ? data.warnings : [])
+      })
       const doPush = () => run('push', () => api.push({}), (data) => {
         setNotice(data.upToDate ? t('pushUpToDate') : t('pushDone', { count: data.count, size: formatBytes(data.bytes) }))
+        setWarnings(Array.isArray(data.warnings) ? data.warnings : [])
+        dirtyRef.current = false
         void load()
       })
       const doCheck = () => run('plan', () => api.pullPlan({}), (data) => {
         setPlan(data)
+        setWarnings(Array.isArray(data.warnings) ? data.warnings : [])
         setConfirmApply(false)
       })
-      const doApply = () => run('apply', async () => {
-        const result = await api.pull({ apply: true })
+      const finishApply = (result, buildNotice) => {
+        if (result && result.applied) {
+          setNotice(buildNotice ? buildNotice(result) : t('pullDone', { added: result.added, updated: result.updated, backup: result.backupId }))
+        } else {
+          const detail = result && Array.isArray(result.warnings) && result.warnings.length > 0 ? ` — ${result.warnings[0]}` : ''
+          setNotice(`${t('notPulled')}${detail}`)
+        }
+        setWarnings(result && Array.isArray(result.warnings) ? result.warnings : [])
         setPlan(null)
         setConfirmApply(false)
-        setNotice(t('pullDone', { added: result.added, updated: result.updated, backup: result.backupId }))
+        setConfirmCommit('')
         void load()
-        return result
-      })
+      }
+
+      const doApply = () => run('apply', async () => finishApply(await api.pull({ apply: true })))
+      const doApplyCommit = (commit) => run(`apply:${commit}`, async () => finishApply(
+        await api.pull({ apply: true, commit }),
+        (result) => t('commitApplied', { id: String(commit).slice(0, 8), added: result.added, updated: result.updated }),
+      ))
       const doBackup = () => run('backup', () => api.backup(), (data) => {
         setNotice(t('backupDone', { id: data.backupId, count: data.count }))
         void load()
@@ -507,10 +590,11 @@ window.__ModuleLoader__.load({
       const doRollback = (id) => run(`rollback:${id}`, () => api.rollback({ id }), (data) => {
         setConfirmRollback('')
         setNotice(t('rollbackDone', { count: data.restored, id: data.id, backup: data.backupId }))
+        setWarnings(Array.isArray(data.skipped) && data.skipped.length > 0 ? data.skipped.map((row) => `${t('rollbackSkipped')}: ${row}`) : [])
         void load()
       })
 
-      const localeTag = () => (String(locale.current).toLowerCase().startsWith('en') ? 'en-US' : 'zh-CN')
+      const localeTag = () => (activeDict === en ? 'en-US' : 'zh-CN')
       const formatTime = (value) => {
         if (!value) return '—'
         try {
@@ -533,7 +617,7 @@ window.__ModuleLoader__.load({
       }
 
       const current = status || {}
-      const disabled = busy !== ''
+      const disabled = busy !== '' || refreshing
       const remoteRow = current.remote
       let remoteText = t('remoteIdle')
       if (remoteRow && remoteRow.error) remoteText = t('remoteFailed', { message: remoteRow.error })
@@ -559,11 +643,20 @@ window.__ModuleLoader__.load({
         ),
       )
 
+      const warningList = (rows) => (Array.isArray(rows) && rows.length > 0
+        ? h('ul', { className: 'dsh-sync-list dsh-sync-warnings', role: 'status' }, rows.slice(0, 8).map((row, index) =>
+            h('li', { className: 'dsh-sync-item', key: index },
+              h('span', { className: 'dsh-sync-item-text' }, h('span', { className: 'dsh-sync-item-meta' }, String(row))),
+            ),
+          ))
+        : null)
+
       const messageRow = h(
         React.Fragment,
         null,
         error ? h('p', { className: 'dsh-sync-error', role: 'alert' }, error) : null,
         notice ? h('p', { className: 'dsh-sync-note dsh-sync-success', role: 'status' }, notice) : null,
+        warningList(warnings),
       )
 
       /* ---------------------------------------------------------- cards */
@@ -712,6 +805,62 @@ window.__ModuleLoader__.load({
         ),
       )
 
+      const mappingRows = Array.isArray(form.pathMappings) ? form.pathMappings : []
+      const mappingCard = h(
+        'section',
+        { className: 'dsh-sync-card' },
+        h('h3', { className: 'dsh-sync-card-title' }, t('mappingsTitle')),
+        h('p', { className: 'dsh-sync-hint' }, t('mappingsHint')),
+        mappingRows.length > 0
+          ? h('ul', { className: 'dsh-sync-list' }, mappingRows.map((row, index) =>
+              h('li', { className: 'dsh-sync-item', key: `${row.from}-${index}` },
+                h('span', { className: 'dsh-sync-item-text' },
+                  h('span', { className: 'dsh-sync-item-title' }, row.from),
+                  h('span', { className: 'dsh-sync-item-meta' }, `→ ${row.to || '—'}`),
+                ),
+                h('button', {
+                  type: 'button',
+                  className: 'dsh-sync-btn dsh-sync-btn-danger',
+                  disabled,
+                  onClick: () => setForm({ ...form, pathMappings: mappingRows.filter((_row, at) => at !== index) }),
+                }, t('remove')),
+              ),
+            ))
+          : null,
+        h('div', { className: 'dsh-sync-grid' },
+          h('input', {
+            className: 'dsh-sync-input',
+            type: 'text',
+            value: form.newMappingFrom || '',
+            placeholder: t('pathFromPlaceholder'),
+            disabled,
+            onChange: (event) => setForm({ ...form, newMappingFrom: event.target.value }),
+          }),
+          h('input', {
+            className: 'dsh-sync-input',
+            type: 'text',
+            value: form.newMappingTo || '',
+            placeholder: t('pathToPlaceholder'),
+            disabled,
+            onChange: (event) => setForm({ ...form, newMappingTo: event.target.value }),
+          }),
+        ),
+        h('div', { className: 'dsh-sync-actions' },
+          h('button', {
+            type: 'button',
+            className: 'dsh-sync-btn',
+            disabled: disabled || !(form.newMappingFrom || '').trim() || !(form.newMappingTo || '').trim(),
+            onClick: () => {
+              const from = (form.newMappingFrom || '').trim()
+              const to = (form.newMappingTo || '').trim()
+              if (from === '' || to === '') return
+              setForm({ ...form, pathMappings: [...mappingRows, { from, to }], newMappingFrom: '', newMappingTo: '' })
+            },
+          }, t('addMapping')),
+          h('button', { type: 'button', className: 'dsh-sync-btn dsh-sync-btn-primary', disabled, onClick: () => void save() }, t('saveConfig')),
+        ),
+      )
+
       const previewBlock = preview
         ? h('div', { className: 'dsh-sync-field' },
             h('p', { className: 'dsh-sync-note' }, t('previewResult', { count: preview.count, size: formatBytes(preview.bytes) })),
@@ -728,6 +877,21 @@ window.__ModuleLoader__.load({
               ? h('ul', { className: 'dsh-sync-list' }, preview.warnings.slice(0, 8).map((row, index) =>
                   h('li', { className: 'dsh-sync-item', key: index }, h('span', { className: 'dsh-sync-item-text' }, h('span', { className: 'dsh-sync-item-meta' }, row))),
                 ))
+              : null,
+            preview.files && preview.files.length > 0
+              ? h('div', { className: 'dsh-sync-field' },
+                  h('button', { type: 'button', className: 'dsh-sync-btn', onClick: () => setShowFiles(!showFiles) }, showFiles ? t('hideFiles') : t('showFiles')),
+                  showFiles
+                    ? h('ul', { className: 'dsh-sync-list' }, preview.files.slice(0, 60).map((row, index) =>
+                        h('li', { className: 'dsh-sync-item', key: `${row.path}-${index}` },
+                          h('span', { className: 'dsh-sync-item-text' },
+                            h('span', { className: 'dsh-sync-item-title' }, row.path),
+                            h('span', { className: 'dsh-sync-item-meta' }, `${t(`source_${row.source}`)} · ${formatBytes(row.size)}`),
+                          ),
+                        ),
+                      ))
+                    : null,
+                )
               : null,
           )
         : null
@@ -835,7 +999,16 @@ window.__ModuleLoader__.load({
                   h('span', { className: 'dsh-sync-item-title' }, row.message),
                   h('span', { className: 'dsh-sync-item-meta' }, `${formatTime(row.date)} · ${row.hash.slice(0, 8)}`),
                 ),
-                row.snapshotId ? h('span', { className: 'dsh-sync-badge' }, row.snapshotId) : null,
+                h('span', { className: 'dsh-sync-row' },
+                  row.snapshotId ? h('span', { className: 'dsh-sync-badge' }, row.snapshotId) : null,
+                  confirmCommit === row.hash
+                    ? h(React.Fragment, null,
+                        h('span', { className: 'dsh-sync-hint' }, t('confirmCommit', { id: row.snapshotId || row.hash.slice(0, 8) })),
+                        h('button', { type: 'button', className: 'dsh-sync-btn dsh-sync-btn-danger', disabled, onClick: () => void doApplyCommit(row.hash) }, t('applyCommit')),
+                        h('button', { type: 'button', className: 'dsh-sync-btn', disabled, onClick: () => setConfirmCommit('') }, t('cancel')),
+                      )
+                    : h('button', { type: 'button', className: 'dsh-sync-btn', disabled, onClick: () => setConfirmCommit(row.hash) }, t('applyCommit')),
+                ),
               ),
             )),
       )
@@ -892,6 +1065,7 @@ window.__ModuleLoader__.load({
         messageRow,
         connectionCard,
         scopeCard,
+        mappingCard,
         actionsCard,
         backupsCard,
         historyCard,
@@ -908,8 +1082,11 @@ window.__ModuleLoader__.load({
         ctx.effect(() => ctx.locale.register(LOCALE_NS, { en, zh }), 'data-sync: dictionaries')
 
         const mounted = ctx.remote.$mount(remote)
-        ctx.effect(async () => {
-          await mounted
+        // An async effect body would leave a rejected mount unattended; swallow it
+        // here and let `acquireNamespace()` report the real failure when used.
+        ctx.effect(() => {
+          mounted.catch(() => {})
+          return () => {}
         })
 
         let remoteNamespace

@@ -23,10 +23,10 @@ import {
   exists,
   mergeSaved,
   messageOf,
+  normalizeWorkspaceRoots,
   portableConfig,
   readJson,
   resolveConfig,
-  slugify,
   writeJsonAtomic,
 } from './lib/util.js'
 import { collectFiles, previewRows } from './lib/collect.js'
@@ -43,6 +43,8 @@ import {
 import {
   applyPull,
   backupNow,
+  backupTargets,
+  bootstrapDigest,
   buildMappings,
   buildManifest,
   listBackups,
@@ -68,17 +70,105 @@ function humanBytes(bytes) {
   return `${(value / 1024 / 1024).toFixed(1)} MiB`
 }
 
-/** Read `storageDir` out of the memory plugin row in the profile patch. */
-async function detectMemoryDir(cfg) {
-  const patch = path.join(cfg.dshHome, 'profiles', cfg.profile, 'cordis.patch.yml')
+/** Read `storageDir` out of a patch file, or '' when it is not there. */
+async function readStorageDirFromPatch(file) {
   try {
-    const text = await fsp.readFile(patch, 'utf8')
+    const text = await fsp.readFile(file, 'utf8')
     const match = /^\s*storageDir:\s*['"]?([^'"\r\n#]+)['"]?\s*$/m.exec(text)
-    if (match && match[1].trim() !== '') return path.resolve(match[1].trim())
+    return match && match[1].trim() !== '' ? path.resolve(match[1].trim()) : ''
   } catch {
-    // patch absent: fall through to the portable default
+    return ''
   }
-  return cfg.memoryDir
+}
+
+/** Patch files of installed bundles, where a plugin may keep its own config. */
+async function bundlePatchFiles(dshHome, profile) {
+  const roots = [path.join(dshHome, 'profiles', profile, 'node_modules'), path.join(dshHome, 'node_modules')]
+  const files = []
+  const read = async (dir) => {
+    let entries = []
+    try {
+      entries = await fsp.readdir(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue
+      if (entry.name.startsWith('.')) continue
+      if (entry.name.startsWith('@')) {
+        let scoped = []
+        try {
+          scoped = await fsp.readdir(path.join(dir, entry.name), { withFileTypes: true })
+        } catch {
+          continue
+        }
+        for (const inner of scoped) {
+          if (inner.isDirectory()) files.push(path.join(dir, entry.name, inner.name, 'cordis.patch.yml'))
+        }
+      } else {
+        files.push(path.join(dir, entry.name, 'cordis.patch.yml'))
+      }
+    }
+  }
+  for (const root of roots) await read(root)
+  return files
+}
+
+/**
+ * Find the memory store of the installed memory plugin. The `storageDir` may be
+ * written in the profile patch, in the home patch, or in the installed bundle's
+ * own patch — on this machine it is the bundle one, so reading only
+ * `profiles/<profile>/cordis.patch.yml` silently pointed at a directory that
+ * does not exist and the push "succeeded" without any memory file.
+ */
+async function detectMemoryDir(cfg) {
+  const env = String(process.env.DSH_MEMORY_DIR || '').trim()
+  const candidates = [
+    await readStorageDirFromPatch(path.join(cfg.dshHome, 'cordis.patch.yml')),
+    env !== '' ? path.resolve(env) : '',
+    await readStorageDirFromPatch(path.join(cfg.dshHome, 'profiles', cfg.profile, 'cordis.patch.yml')),
+  ]
+  for (const file of await bundlePatchFiles(cfg.dshHome, cfg.profile)) {
+    const found = await readStorageDirFromPatch(file)
+    if (found !== '') candidates.push(found)
+  }
+  const usable = candidates.find((candidate) => candidate !== '' && exists(candidate))
+  if (usable) return usable
+  return candidates.find((candidate) => candidate !== '') || cfg.memoryDir
+}
+
+/**
+ * Infer the profile this installation belongs to: the host may already have the
+ * profile directory and pass it as a launch argument (DSH_PROFILE is only
+ * guaranteed inside model shell calls), so prefer the profile that actually has
+ * this bundle installed.
+ */
+async function inferProfile(dshHome, log) {
+  const root = path.join(dshHome, 'profiles')
+  let entries = []
+  try {
+    entries = await fsp.readdir(root, { withFileTypes: true })
+  } catch {
+    return ''
+  }
+  const dirs = entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name)
+  if (dirs.length === 0) return ''
+  const matches = []
+  for (const dir of dirs) {
+    try {
+      const pkg = JSON.parse(await fsp.readFile(path.join(root, dir, 'package.json'), 'utf8'))
+      const deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) }
+      if (Object.prototype.hasOwnProperty.call(deps, PACKAGE)) matches.push(dir)
+    } catch {
+      // profile without a readable package.json: not a candidate
+    }
+  }
+  if (matches.length === 1) return matches[0]
+  if (matches.length > 1) {
+    await log.append('warn', `several profiles install ${PACKAGE} (${matches.join(', ')}); set the profile explicitly in Settings`)
+    return ''
+  }
+  return dirs.length === 1 ? dirs[0] : ''
 }
 
 /* ----------------------------------------------------------------- runtime */
@@ -96,6 +186,11 @@ function createRuntime(rawConfig) {
     if (readyPromise) return readyPromise
     readyPromise = (async () => {
       await ensureDir(cfg.dataDir)
+      const rawProfile = rawConfig && typeof rawConfig === 'object' && typeof rawConfig.profile === 'string' ? rawConfig.profile.trim() : ''
+      if (rawProfile === '' && String(process.env.DSH_PROFILE || '').trim() === '') {
+        const inferred = await inferProfile(cfg.dshHome, log)
+        if (inferred !== '' && inferred !== cfg.profile) cfg = resolveConfig({ ...(rawConfig || {}), profile: inferred })
+      }
       const saved = await readJson(cfg.configPath, null)
       const patchMemoryDir = rawConfig && typeof rawConfig === 'object' && typeof rawConfig.memoryDir === 'string' ? rawConfig.memoryDir.trim() : ''
       const savedMemoryDir = saved && typeof saved.memoryDir === 'string' ? saved.memoryDir.trim() : ''
@@ -138,14 +233,7 @@ function createRuntime(rawConfig) {
         skills: typeof input.sources.skills === 'boolean' ? input.sources.skills : cfg.sources.skills,
       }
     }
-    if (Array.isArray(input.workspaceRoots)) {
-      next.workspaceRoots = input.workspaceRoots
-        .filter((row) => row && typeof row.path === 'string' && row.path.trim() !== '')
-        .map((row) => ({
-          label: typeof row.label === 'string' && row.label.trim() !== '' ? row.label.trim() : slugify(row.path),
-          path: path.resolve(row.path),
-        }))
-    }
+    if (Array.isArray(input.workspaceRoots)) next.workspaceRoots = normalizeWorkspaceRoots(input.workspaceRoots)
     if (Array.isArray(input.pathMappings)) {
       next.pathMappings = input.pathMappings
         .filter((row) => row && typeof row.from === 'string' && row.from.trim() !== '')
@@ -170,25 +258,25 @@ function createRuntime(rawConfig) {
     return cfg
   }
 
-  /** The git clone plus the remote snapshot, ready to read. */
-  async function loadRemote() {
+  /** The git clone plus a specific remote snapshot, ready to read. */
+  async function loadRemote(commit) {
     if (!cfg.repoUrl) throw fail('NO_REPO', 'no repository URL is configured yet')
     const token = await currentToken()
     await ensureRepo(cfg, token, log)
-    return { token, ...(await resetToRemote(cfg, token)) }
+    return { token, ...(await resetToRemote(cfg, token, commit)) }
   }
 
   async function guardPrivate(token) {
     if (!token) return { isPrivate: false, verified: false }
     try {
       const info = await verifyRepoPrivate(cfg.repoUrl, token)
-      if (info.exists && info.isPrivate === false) {
+      if (info.exists && info.isPrivate === false && info.unknown !== true) {
         throw fail(
           'PUBLIC_REPO',
           `the repository ${info.fullName} is public. This snapshot contains machine names, the plugin list and the memory store — make it private in GitHub settings first.`,
         )
       }
-      return { isPrivate: info.isPrivate, verified: info.exists }
+      return { isPrivate: info.isPrivate, verified: info.exists && info.unknown !== true }
     } catch (error) {
       if (error && error.code === 'PUBLIC_REPO') throw error
       return { isPrivate: false, verified: false, error: messageOf(error) }
@@ -208,13 +296,14 @@ function createRuntime(rawConfig) {
       if (!cfg.repoUrl) warnings.push('no repository is configured yet')
       if (cfg.sources.memory && !exists(cfg.memoryDir)) warnings.push(`memory directory not found: ${cfg.memoryDir}`)
       if (!exists(path.join(cfg.repoDir, '.git')) && cfg.repoUrl) warnings.push('the repository has not been cloned on this machine yet')
+      if (token === '' && cfg.repoUrl.includes('github.com')) warnings.push('no token is stored, so git falls back to your credential helper for https://github.com')
       let remote = st.remote || null
       if (input.refreshRemote === true && cfg.repoUrl && exists(path.join(cfg.repoDir, '.git'))) {
         await exclusive(async () => {
           try {
             await ensureRepo(cfg, token, log)
             const counts = await aheadBehind(cfg, token)
-            remote = { checkedAt: Date.now(), ahead: counts.ahead, behind: counts.behind, headCommit: '', error: '' }
+            remote = { checkedAt: Date.now(), ahead: counts.ahead, behind: counts.behind, headCommit: counts.remoteHead || counts.headCommit, error: '' }
             await state.patch({ remote })
           } catch (error) {
             remote = { checkedAt: Date.now(), ahead: 0, behind: 0, headCommit: '', error: messageOf(error) }
@@ -223,6 +312,7 @@ function createRuntime(rawConfig) {
         })
       }
       const interval = cfg.autoBackup.intervalHours * 3600 * 1000
+      const lastRun = st.autoBackup && st.autoBackup.lastRunAt ? st.autoBackup.lastRunAt : 0
       return {
         configured: cfg.repoUrl !== '',
         repoUrl: cfg.repoUrl,
@@ -240,7 +330,7 @@ function createRuntime(rawConfig) {
         autoBackup: {
           enabled: cfg.autoBackup.enabled,
           intervalHours: cfg.autoBackup.intervalHours,
-          nextAt: st.autoBackup && st.autoBackup.lastRunAt ? st.autoBackup.lastRunAt + interval : 0,
+          nextAt: cfg.autoBackup.enabled && cfg.repoUrl !== '' ? (lastRun > 0 ? lastRun + interval : Date.now() + interval) : 0,
           lastError: (st.autoBackup && st.autoBackup.lastError) || '',
         },
         tokenPresent: token !== '',
@@ -257,8 +347,15 @@ function createRuntime(rawConfig) {
 
     async saveConfig(request) {
       await ready()
-      await saveConfig(request)
-      return await service.status({})
+      return await exclusive(async () => {
+        const previousRepo = cfg.repoUrl
+        const previousBranch = cfg.branch
+        await saveConfig(request)
+        // A different remote or branch makes the cached ahead/behind counters a
+        // statement about a repository this machine no longer tracks.
+        if (cfg.repoUrl !== previousRepo || cfg.branch !== previousBranch) await state.patch({ remote: null })
+        return await service.status({})
+      })
     },
 
     async preview() {
@@ -288,15 +385,30 @@ function createRuntime(rawConfig) {
         const started = Date.now()
         const token = await currentToken()
         const collected = await collectFiles(cfg)
-        if (collected.secretFindings.length > 0 && !cfg.allowSecrets) {
-          const first = collected.secretFindings.slice(0, 3).map((row) => `${row.path}:${row.line} (${row.kind})`).join(', ')
+        if (collected.count === 0) {
+          throw fail(
+            'EMPTY_SNAPSHOT',
+            'refusing to write an empty snapshot: no file matched the current selection. Check the sources, the memory directory and the workspace roots.',
+          )
+        }
+        const findings = collected.secretFindings
+        if (findings.length > 0 && !cfg.allowSecrets && input.dryRun !== true) {
+          const first = findings.slice(0, 3).map((row) => `${row.path}:${row.line} (${row.kind})`).join(', ')
           throw fail(
             'SECRETS_FOUND',
-            `refusing to push: ${collected.secretFindings.length} credential-shaped value(s) found — ${first}. Remove them, or turn on "allow secrets" in the plugin config if they are placeholders.`,
+            `refusing to push: ${findings.length} credential-shaped value(s) found — ${first}. Remove them, or turn on "allow secrets" in the plugin config if they are placeholders.`,
           )
         }
         const snapshotId = newSnapshotId()
+        const baseWarnings = [...collected.warnings]
+        if (cfg.sources.memory && (collected.bySource.memory || 0) === 0) {
+          baseWarnings.push(`the memory source is enabled but no memory file was found under ${cfg.memoryDir} — the snapshot carries no memory`)
+        }
         if (input.dryRun === true) {
+          const warnings = [...baseWarnings]
+          if (findings.length > 0 && !cfg.allowSecrets) {
+            warnings.push(`a real push would be refused: ${findings.length} credential-shaped value(s) found`)
+          }
           return {
             snapshotId,
             count: collected.count,
@@ -306,27 +418,28 @@ function createRuntime(rawConfig) {
             upToDate: false,
             dryRun: true,
             durationMs: Date.now() - started,
-            warnings: collected.warnings,
-            secretFindings: collected.secretFindings,
+            warnings,
+            secretFindings: findings,
           }
         }
         const privacy = await guardPrivate(token)
+        const privacyWarning = privacy.verified
+          ? privacy.isPrivate ? '' : 'the repository is reachable but not confirmed private — GitHub reports it as public'
+          : 'repository visibility could not be verified (no token or the GitHub API is unreachable); make sure it is private'
+        if (privacyWarning !== '') baseWarnings.push(privacyWarning)
         const { cloned, branchExists } = await ensureRepo(cfg, token, log)
         const digest = payloadDigest(collected)
+        const bootstrap = await bootstrapDigest()
         const existing = await readJson(path.join(cfg.repoDir, 'manifest.json'), null)
         const repo = await repoState(cfg, token)
-        if (
-          existing
-          && typeof existing.digest === 'string'
-          && existing.digest === digest
-          && repo.clean
-          && repo.ahead === 0
-        ) {
+        const samePayload = Boolean(existing) && typeof existing.digest === 'string' && existing.digest === digest
+        const sameBootstrap = Boolean(existing) && typeof existing.bootstrapDigest === 'string' && existing.bootstrapDigest === bootstrap
+        if (samePayload && sameBootstrap && repo.clean && repo.ahead === 0) {
           const unchangedId = existing.snapshotId || snapshotId
           await state.patch({
             lastPush: { at: Date.now(), snapshotId: unchangedId, commit: repo.head, count: collected.count, bytes: collected.bytes },
           })
-          await log.append('info', `push skipped: payload unchanged since ${unchangedId}`)
+          await log.append('info', `push skipped: payload and plugin copy unchanged since ${unchangedId}`)
           return {
             snapshotId: unchangedId,
             count: collected.count,
@@ -336,11 +449,11 @@ function createRuntime(rawConfig) {
             upToDate: true,
             dryRun: false,
             durationMs: Date.now() - started,
-            warnings: collected.warnings,
-            secretFindings: collected.secretFindings,
+            warnings: [...baseWarnings, 'payload and plugin copy unchanged — no commit was created'],
+            secretFindings: findings,
           }
         }
-        const manifest = buildManifest(cfg, collected, snapshotId)
+        const manifest = buildManifest(cfg, collected, snapshotId, { bootstrapDigest: bootstrap })
         const writeWarnings = await writeSnapshotTree(cfg, manifest, collected)
         const message = typeof input.message === 'string' && input.message.trim() !== ''
           ? `snapshot: ${snapshotId} — ${input.message.trim()}`
@@ -351,9 +464,8 @@ function createRuntime(rawConfig) {
           remote: { checkedAt: Date.now(), ahead: 0, behind: 0, headCommit: result.commit, error: '' },
         })
         await log.append('info', `push ${snapshotId}: ${collected.count} files, ${humanBytes(collected.bytes)}, commit ${result.commit || 'none'}`)
-        const warnings = [...collected.warnings, ...writeWarnings]
+        const warnings = [...baseWarnings, ...writeWarnings]
         if (!branchExists && !cloned) warnings.push(`created a new local branch "${cfg.branch}"; confirm the remote branch name matches`)
-        if (privacy.verified && !privacy.isPrivate) warnings.push('visibility could not be confirmed as private')
         return {
           snapshotId,
           count: collected.count,
@@ -373,7 +485,7 @@ function createRuntime(rawConfig) {
       await ready()
       return await exclusive(async () => {
       const input = request && typeof request === 'object' ? request : {}
-      const { manifest, commit } = await loadRemote()
+      const { manifest, commit } = await loadRemote(input.commit)
       const st = await state.read()
       if (!manifest) {
         return {
@@ -411,10 +523,14 @@ function createRuntime(rawConfig) {
       await ready()
       return await exclusive(async () => {
         const input = request && typeof request === 'object' ? request : {}
-        const { manifest, commit } = await loadRemote()
+        const { manifest, commit } = await loadRemote(input.commit)
         if (!manifest) throw fail('NO_SNAPSHOT', 'the remote branch has no snapshot to apply yet')
+        if (manifest.schema !== 'dsh-data-sync/1') {
+          throw fail('MANIFEST_SCHEMA', `the remote snapshot uses schema "${manifest.schema}", this plugin understands "dsh-data-sync/1"`)
+        }
         const mappings = withOverrides(buildMappings(cfg, manifest), input.mappings)
         const plan = await planPull(cfg, manifest, mappings)
+        const mapped = mappings.map((row) => ({ from: row.from, to: row.to }))
         if (input.apply !== true) {
           return {
             applied: false,
@@ -423,18 +539,57 @@ function createRuntime(rawConfig) {
             added: plan.actions.filter((row) => row.action === 'add').length,
             updated: plan.actions.filter((row) => row.action === 'update').length,
             skipped: plan.skipped,
-            mappings: mappings.map((row) => ({ from: row.from, to: row.to })),
+            mappings: mapped,
             warnings: ['dry run: nothing was written'],
           }
         }
-        const willCreate = plan.actions.filter((row) => row.action === 'add' && row.target).map((row) => row.target)
-        const backup = await backupNow(cfg, { reason: 'pre-pull', willCreate })
-        await state.patch({ lastBackup: { at: Date.now(), id: backup.id, reason: 'pre-pull', count: backup.count } })
-        const applied = await applyPull(cfg, manifest, mappings)
-        await state.patch({
-          lastPull: { at: Date.now(), snapshotId: manifest.snapshotId || '', count: applied.added.length + applied.updated.length },
-          remote: { checkedAt: Date.now(), ahead: 0, behind: 0, headCommit: commit, error: '' },
+        const changes = plan.actions.filter((row) => row.action !== 'same')
+        const skipWarnings = plan.skipped.length > 0
+          ? [`${plan.skipped.length} file(s) cannot be placed on this machine: ${plan.skipped.slice(0, 3).map((row) => `${row.path} (${row.reason})`).join(', ')}`]
+          : []
+        if (changes.length === 0) {
+          const warnings = skipWarnings.length > 0
+            ? ['nothing could be written: every file in the snapshot was skipped', ...skipWarnings]
+            : ['the remote snapshot already matches this machine; nothing was written and no backup was taken']
+          return {
+            applied: false,
+            snapshotId: manifest.snapshotId || '',
+            backupId: '',
+            added: 0,
+            updated: 0,
+            skipped: plan.skipped,
+            mappings: mapped,
+            warnings,
+          }
+        }
+        const willCreate = changes.filter((row) => row.action === 'add' && row.target).map((row) => row.target)
+        // Back up exactly the files this pull will touch: a backup built from the
+        // current-profile whitelist could miss a target and make the rollback
+        // incomplete.
+        const backup = await backupTargets(cfg, {
+          reason: 'pre-pull',
+          targets: changes.filter((row) => row.target).map((row) => ({ target: row.target, source: row.source, rel: row.path })),
+          willCreate,
         })
+        await state.patch({ lastBackup: { at: Date.now(), id: backup.id, reason: 'pre-pull', count: backup.count } })
+        let applied = null
+        try {
+          applied = await applyPull(cfg, manifest, mappings, plan)
+        } catch (error) {
+          const restored = await rollbackTo(cfg, backup.id).catch(() => null)
+          await log.append('error', `pull ${manifest.snapshotId} failed: ${messageOf(error)}; backup ${backup.id}${restored ? ` restored ${restored.restored} file(s)` : ' NOT restored'}`)
+          throw fail(
+            'APPLY_FAILED',
+            `writing the snapshot failed: ${messageOf(error)}. Backup ${backup.id} was ${restored ? `restored (${restored.restored} file(s))` : 'NOT restored automatically'}; use data_sync_rollback with that id.`,
+          )
+        }
+        const updates = {
+          lastPull: { at: Date.now(), snapshotId: manifest.snapshotId || '', count: applied.added.length + applied.updated.length },
+        }
+        // A historical pull leaves the branch head where it was; recording it as
+        // the checked head would make `status` describe the wrong commit.
+        if (!input.commit) updates.remote = { checkedAt: Date.now(), ahead: 0, behind: 0, headCommit: commit, error: '' }
+        await state.patch(updates)
         await log.append('info', `pull ${manifest.snapshotId}: ${applied.added.length} added, ${applied.updated.length} updated, backup ${backup.id}`)
         return {
           applied: true,
@@ -443,8 +598,8 @@ function createRuntime(rawConfig) {
           added: applied.added.length,
           updated: applied.updated.length,
           skipped: applied.skipped,
-          mappings: mappings.map((row) => ({ from: row.from, to: row.to })),
-          warnings: [],
+          mappings: mapped,
+          warnings: skipWarnings,
         }
       })
     },
@@ -470,8 +625,8 @@ function createRuntime(rawConfig) {
       return await exclusive(async () => {
         const input = request && typeof request === 'object' ? request : {}
         const result = await rollbackTo(cfg, input.id)
-        await log.append('info', `rollback ${input.id}: ${result.restored} file(s) restored`)
-        return { id: String(input.id || ''), restored: result.restored, backupId: result.safetyBackupId }
+        await log.append('info', `rollback ${input.id}: ${result.restored} file(s) restored, ${result.skipped.length} skipped`)
+        return { id: String(input.id || ''), restored: result.restored, backupId: result.safetyBackupId, skipped: result.skipped }
       })
     },
 
@@ -490,6 +645,10 @@ function createRuntime(rawConfig) {
 
     async init(request) {
       await ready()
+      // Connecting writes config.json and resets the clone, so it belongs in the
+      // same queue as push/pull — otherwise a scheduled push can see cfg change
+      // halfway through its own awaits.
+      return await exclusive(async () => {
       const input = request && typeof request === 'object' ? request : {}
       const token = await currentToken()
       let created = false
@@ -511,15 +670,22 @@ function createRuntime(rawConfig) {
         warnings.push('repository visibility could not be verified without a token; make sure it is private')
       }
       await log.append('info', `init ${cfg.repoUrl} (${cfg.branch})${created ? ' — created' : ''}`)
+      let bootstrapped = false
+      try {
+        bootstrapped = !(await resetToRemote(cfg, token)).missing
+      } catch {
+        bootstrapped = false
+      }
       return {
         repoUrl: cfg.repoUrl,
         branch: cfg.branch,
         created,
         isPrivate: privacy.isPrivate,
         cloned: cloned || exists(path.join(cfg.repoDir, '.git')),
-        bootstrapped: true,
+        bootstrapped,
         warnings,
       }
+      })
     },
   }
 
@@ -607,7 +773,7 @@ export const remoteContribution = {
 const GUIDANCE = [
   '## DSH data sync (this machine)',
   '- A `@local/dsh-data-sync` plugin can snapshot this harness (profile config, memory store, skills) into a private git repository and restore it on another machine with absolute paths remapped.',
-  '- Use `data_sync_status` before claiming anything about the sync state; `data_sync_push` writes a snapshot, `data_sync_pull` (apply: false) only previews what a pull would change.',
+  '- Use `data_sync_status` before claiming anything about the sync state; `data_sync_push` writes a snapshot, `data_sync_pull` (apply: false) only previews what a pull would change, and `data_sync_pull` with a `commit` applies an older snapshot from the remote history.',
   '- Never invent a repository URL or token, and never enable "allow secrets": the snapshot deliberately excludes credentials.',
 ].join('\n')
 
@@ -625,8 +791,10 @@ function presentCall(title) {
 const TOOL_TITLES = {
   data_sync_status: 'Data sync status',
   data_sync_configure: 'Configure data sync',
+  data_sync_init: 'Connect data sync repository',
   data_sync_push: 'Push snapshot',
   data_sync_pull: 'Pull snapshot',
+  data_sync_history: 'Snapshot history',
   data_sync_backup: 'Back up now',
   data_sync_rollback: 'Roll back to backup',
 }
@@ -713,8 +881,9 @@ export function apply(ctx, rawConfig) {
       parameters: {
         type: 'object',
         properties: {
-          repoUrl: { type: 'string', description: 'Private git repository URL, for example https://github.com/you/DSH-Sync-Data.git' },
+          repoUrl: { type: 'string', description: 'Private git repository URL, for example https://github.com/you/DSH-Sync-Data.git. An empty string clears it.' },
           branch: { type: 'string', description: 'Branch to push/pull, default main.' },
+          profile: { type: 'string', description: 'Harness profile to snapshot, for example desktop. Default: detected from $DSH_PROFILE or from the profile that installs this plugin.' },
           token: { type: 'string', description: 'GitHub token with repo scope. Stored only in the local credential file.' },
           tokenClear: { type: 'boolean', description: 'Forget the stored token.' },
           sources: {
@@ -792,11 +961,12 @@ export function apply(ctx, rawConfig) {
     ctx.tools.register({
       name: 'data_sync_pull',
       description:
-        'Apply the snapshot in the private repository to this machine, with the recorded absolute paths remapped to local paths. `apply: false` (the default) only previews the plan: per-file add/update/same and the mapping table. A real apply takes a local backup first; `backupId` names it for a rollback. Use it on the new machine after installing the plugin and connecting the repository.',
+        'Apply the snapshot in the private repository to this machine, with the recorded absolute paths remapped to local paths. `apply: false` (the default) only previews the plan: per-file add/update/same and the mapping table. A real apply takes a local backup first; `backupId` names it for a rollback. Pass `commit` to apply an older snapshot from the remote history instead of the branch head. Use it on the new machine after installing the plugin and connecting the repository.',
       parameters: {
         type: 'object',
         properties: {
           apply: { type: 'boolean', description: 'false (default) = preview only; true = back up and write the files.' },
+          commit: { type: 'string', description: 'Optional commit hash from the remote history; applies that snapshot instead of the branch head.' },
           mappings: {
             type: 'array',
             description: 'One-shot old-path → new-path overrides for this pull only.',
@@ -814,6 +984,48 @@ export function apply(ctx, rawConfig) {
       presentCall: presentCall(TOOL_TITLES.data_sync_pull),
       async execute(args) {
         return await service.pull(args || {})
+      },
+    }),
+  )
+
+  ctx.effect(() =>
+    ctx.tools.register({
+      name: 'data_sync_init',
+      description:
+        'Connect this machine to a private git repository: store the URL (and branch), verify it is private when a token is available, and clone it. Pass `createPrivateName` to create a brand-new private GitHub repository with the stored token first. Use it once per machine, before the first push; `data_sync_configure` sets a URL without cloning.',
+      parameters: {
+        type: 'object',
+        properties: {
+          repoUrl: { type: 'string', description: 'Repository URL to connect, for example https://github.com/you/DSH-Sync-Data.git' },
+          branch: { type: 'string', description: 'Branch to push/pull, default keeps the configured one.' },
+          createPrivateName: { type: 'string', description: 'Create a new private repository with this name on the token account, then connect it.' },
+        },
+        additionalProperties: false,
+      },
+      output: toolOutput(),
+      presentCall: presentCall(TOOL_TITLES.data_sync_init),
+      async execute(args) {
+        return await service.init(args || {})
+      },
+    }),
+  )
+
+  ctx.effect(() =>
+    ctx.tools.register({
+      name: 'data_sync_history',
+      description:
+        'List the snapshots in the remote history (commit, date, message and snapshot id). Pass one of the returned commit hashes to `data_sync_pull` with `apply: true` to restore that version. Use it when the user asks what was backed up when, or wants to go back to an earlier snapshot.',
+      parameters: {
+        type: 'object',
+        properties: {
+          limit: { type: 'integer', minimum: 1, maximum: 100, description: 'How many commits to list, default 20.' },
+        },
+        additionalProperties: false,
+      },
+      output: toolOutput(),
+      presentCall: presentCall(TOOL_TITLES.data_sync_history),
+      async execute(args) {
+        return await service.history(args || {})
       },
     }),
   )
