@@ -18,6 +18,9 @@ $DSH_HOME + 记忆库 + 技能  ──push──►  manifest.json + files/  ─
 ```powershell
 # 一条命令：dsh plugin 会把 add 转发给 profile 里的 pnpm，github: 缩写由 pnpm 解析
 dsh plugin --profile desktop add github:ttkxyglj/dsh-data-sync
+
+# 想固定版本（推荐换机时用，避免拉到未验证的新提交）：
+dsh plugin --profile desktop add github:ttkxyglj/dsh-data-sync#v0.5.0
 ```
 
 也可以 `git clone` 后跑包内的安装脚本（离线、或想锁定某个提交时）：
