@@ -10,6 +10,27 @@ $DSH_HOME + 记忆库 + 技能  ──push──►  manifest.json + files/  ─
 
 不做「同步文件夹」：只同步一张**有限白名单**，git 负责历史与回滚，凭据永远不进去。
 
+## 安装
+
+插件本身在公开仓库 **[ttkxyglj/dsh-data-sync](https://github.com/ttkxyglj/dsh-data-sync)**（与本 README 同源），
+新电脑不需要先有快照仓库就能装：
+
+```powershell
+# 一条命令：dsh plugin 会把 add 转发给 profile 里的 pnpm，github: 缩写由 pnpm 解析
+dsh plugin --profile desktop add github:ttkxyglj/dsh-data-sync
+```
+
+也可以 `git clone` 后跑包内的安装脚本（离线、或想锁定某个提交时）：
+
+```powershell
+git clone https://github.com/ttkxyglj/dsh-data-sync.git
+powershell -ExecutionPolicy Bypass -File .\dsh-data-sync\install.ps1 -Profile desktop
+# macOS / Linux: ./dsh-data-sync/install.sh desktop
+```
+
+装完**重启 Harness**。换机恢复时，快照仓库里的 `bootstrap/dsh-data-sync/` 本来就是这份代码的副本，
+所以即使没有网络，也能从快照仓库把插件装回来。
+
 ---
 
 ## 1. 它同步什么
@@ -134,14 +155,16 @@ $DSH_HOME/dsh-data-sync/
 ## 8. 开发
 
 ```powershell
-# 语法与测试（用 DSH 自带 Node 即可）
-node --check plugin/index.js
+# 语法与测试（用 DSH 自带 Node 即可；仓库根目录就是插件包根目录）
+node --check index.js
 node --test test/core.test.mjs test/host.test.mjs
 ```
 
 测试不联网：round-trip 用本地裸仓库跑「推送 → 克隆 → 重映射 → 拉取 → 回滚」，
 host 测试用一个假 Cordis 上下文跑真实 `apply()`，验证 12 个 Remote 方法、9 个工具与服务行为，
 以及「校验快照能发现被篡改的载荷」「远端保留既按天数又保底最新 N 版」两条闸门。
+CI 定义在 `docs/ci-workflow.yml`：把它复制为仓库里的 `.github/workflows/test.yml`
+（推送它的令牌需要 `workflow` scope）即可让 GitHub Actions 自动跑同一套测试。
 
 ## 9. License
 

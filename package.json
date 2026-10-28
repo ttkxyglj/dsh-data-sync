@@ -6,6 +6,14 @@
   "description": "Move a DeepSeek Harness installation between machines: snapshot the profile configuration, the long-term memory store and the skills into a private git repository, restore them with absolute-path remapping, and keep a local backup rotation plus a scheduled automatic backup.",
   "license": "MIT",
   "author": "Erji Gao",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ttkxyglj/dsh-data-sync.git"
+  },
+  "homepage": "https://github.com/ttkxyglj/dsh-data-sync#readme",
+  "bugs": {
+    "url": "https://github.com/ttkxyglj/dsh-data-sync/issues"
+  },
   "keywords": [
     "deepseek-harness",
     "dsh",
