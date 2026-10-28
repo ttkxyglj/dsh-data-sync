@@ -1,5 +1,48 @@
 # Changelog
 
+## 0.5.0 — 2026-10-28
+
+Inspired by what mature dotfiles/config-sync tools do (chezmoi `verify`/`diff`, borg/style
+`keep-last` retention, bootstrap installers), plus the gaps this plugin still had.
+
+### Added — `data_sync_verify`: a backup that proves itself
+
+- New Remote method `verify` + tool `data_sync_verify` + **校验快照** button. It re-reads
+  every payload in the clone and checks sha256 and size against the manifest, recomputes the
+  manifest digest from its own file list, and lists the files that differ between this
+  machine and the snapshot. `commit` verifies an older version.
+  *(`verify re-reads every payload and reports a tampered snapshot`,
+  covered through the service in `push, plan, pull and rollback work through the service`)*
+- The same command is now step 3 of `BOOTSTRAP.md`: a pull only says what *would* be
+  written; verify says the restored bytes *are* the pushed version.
+
+### Added — retention keeps the newest versions (`keepLast`)
+
+- `remoteRetention.keepLast` (default 3, 1–50): the newest N snapshots are never pruned even
+  when they are older than the window — the `--keep-last` policy from borg/restic instead of
+  "newest one only". Settings exposes it next to the day count.
+  *(`retention keeps the newest versions even when they are older than the window`)*
+
+### Added — one-command install on the new machine
+
+- Snapshots now carry `bootstrap/dsh-data-sync/install.ps1` and `install.sh`; each links the
+  plugin into a profile (`dsh plugin --profile <p> add <path>`, which forwards to pnpm) and
+  prints the next two steps. `BOOTSTRAP.md`, the README and the plugin package `files` list
+  were updated. Checked against this machine's CLI: `dsh plugin --help` forwards to pnpm.
+
+### Fixed — Windows path mappings were case-sensitive
+
+- A mapping such as `D:\dsh-memory → E:\mem` did not rewrite `d:\DSH-MEMORY\…`, although
+  Windows paths are case-insensitive. Drive-letter rules are now matched case-insensitively
+  (`i` flag) while POSIX rules stay case-sensitive; replacements are parked in tokens so a
+  rule still cannot rewrite another rule's output.
+  *(`drive-letter mappings are case-insensitive, POSIX ones are not`)*
+
+### Changed — pull plan reports the size delta
+
+- `PullPlan.actions` gained `localSize`; the page summarises "new X, rewritten Y (replaces Z
+  locally)" so a pull that overwrites a large local file is visible before it happens.
+
 ## 0.4.0 — 2026-10-27
 
 ### Added — remote retention (keep three days, always keep the newest)

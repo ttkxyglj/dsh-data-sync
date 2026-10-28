@@ -45,8 +45,12 @@ $DSH_HOME + 记忆库 + 技能  ──push──►  manifest.json + files/  ─
 **远端历史可回退，也自动瘦身**：远端每个提交都是一版快照。
 `pull` 不带 `commit` = 恢复**最新那一版**（比如今天推的）；在历史列表里点「应用此版本」= 恢复某一天的版本。
 推送成功后，超过**保留天数**（默认 3 天）的旧版本会从远端分支历史里删掉，以控制仓库体积；
-**最新那一版永远保留**，即使它本身已经超过天数。清理是重写历史 + `--force-with-lease` 强推：
+**最新 3 版永远保留**（可调，最少 1 版），即使它们本身已经超过天数。清理是重写历史 + `--force-with-lease` 强推：
 被分支保护或别的机器抢先推送挡住时会整体放弃并回滚本地分支，不会删掉任何东西。
+
+**备份可以自证**：「校验快照」不信任清单，而是把仓库里的每个文件重新读一遍，逐个核对 sha256 与大小，
+再重算一遍清单摘要，并列出本机与这一版不同的文件。推送后、拉取后、清空机器前都值得点一下——
+`pull` 的计划只说明「将要写什么」，`verify` 才说明「写出来的确实是那一版」。
 
 ## 3. 路径重映射
 
@@ -58,6 +62,8 @@ $DSH_HOME + 记忆库 + 技能  ──push──►  manifest.json + files/  ─
 
 文本文件按原样改写，同时处理 `\`、`/` 与 JSON 里的 `\\` 三种写法，所以
 `package.json` 的 `link:` 依赖、`cordis.patch.yml` 的 `storageDir`、`memories.json` 里项目键的绝对路径都能对上。
+盘符路径（`D:\…`）**大小写不敏感**——`d:\DSH-Memory` 也能匹配 `D:\dsh-memory`（Windows 本来就不区分）；
+POSIX 路径规则保持大小写敏感。
 
 ## 4. 用起来
 
@@ -74,12 +80,17 @@ $DSH_HOME + 记忆库 + 技能  ──push──►  manifest.json + files/  ─
 
 ### 4.2 新机器（恢复）
 
-```bash
+```powershell
 git clone https://github.com/you/DSH-Sync-Data.git dsh-sync-data
-dsh plugin --profile desktop add ./dsh-sync-data/bootstrap/dsh-data-sync
+# Windows
+powershell -ExecutionPolicy Bypass -File ./dsh-sync-data/bootstrap/dsh-data-sync/install.ps1 -Profile desktop
+# macOS / Linux
+./dsh-sync-data/bootstrap/dsh-data-sync/install.sh desktop
 ```
 
-重启 Harness → **设置 → 数据同步** → 填同一个仓库与令牌 → **连接** → **检查远端** 看计划与映射 → **应用拉取** → 重启 Harness。
+（等价长命令：`dsh plugin --profile desktop add ./dsh-sync-data/bootstrap/dsh-data-sync`。）
+
+重启 Harness → **设置 → 数据同步** → 填同一个仓库与令牌 → **连接** → **检查远端** 看计划与映射 → **应用拉取** → **校验快照** → 重启 Harness。
 默认「应用拉取」恢复的就是**最新一版**（今天推的那版）；想恢复昨天/前天的版本，在**备份与历史**卡片里找到对应提交，
 点「应用此版本」——同样先备份本机。
 插件栈由 `cd ~/.dsh/profiles/desktop && pnpm install` 重建（`pnpm-lock.yaml` 已经跟着过来了）。
@@ -90,11 +101,12 @@ dsh plugin --profile desktop add ./dsh-sync-data/bootstrap/dsh-data-sync
 | 工具 | 作用 |
 |---|---|
 | `data_sync_status` | 读状态：仓库、来源、上次推送/拉取/备份、远端 ahead/behind、日志尾部 |
-| `data_sync_configure` | 改配置：仓库、分支、profile、令牌、来源、记忆目录、工作区、路径改写、保留份数、定时备份、远端保留天数 |
+| `data_sync_configure` | 改配置：仓库、分支、profile、令牌、来源、记忆目录、工作区、路径改写、保留份数、定时备份、远端保留天数/最少保留版数 |
 | `data_sync_init` | 连接仓库（可选用令牌直接新建一个**私有**仓库并克隆） |
 | `data_sync_push` | 收集并推送一版快照（成功后按保留天数清理旧版本）；`dryRun: true` 只看不发 |
 | `data_sync_pull` | `apply: false`（默认）只出计划；`apply: true` 先备份再写入**最新一版**；传 `commit` 恢复指定版本 |
 | `data_sync_history` | 列出远端历史快照（提交、时间、说明、快照 id） |
+| `data_sync_verify` | 校验一版快照：重读全部载荷、核对 sha256/大小/清单摘要，并列出本机与它的差异；`commit` 可校验历史版本 |
 | `data_sync_backup` | 只做本机备份，不碰远端 |
 | `data_sync_rollback` | 恢复到某个本机备份（会先做一次安全备份） |
 
@@ -103,7 +115,7 @@ dsh plugin --profile desktop add ./dsh-sync-data/bootstrap/dsh-data-sync
 - **凭据不同步**：新机器用 `dsh auth` 或手写 `.credentials.yaml` 重新登录；这是设计，不是遗漏。
 - **工作区里的 git 仓库不复制**：只带 `.dsh/skills` 这类配置，代码仓库继续用 `git clone`。
 - **`pnpm install` 不是同步的一步**：版本由锁文件钉住，但装不装是这台机器的决定。
-- **远端历史会按保留天数重写**：默认保留 3 天、最新一版永不删除；如果你更想保留完整历史，把「保留天数」调大或关掉这个开关。
+- **远端历史会按保留天数重写**：默认保留 3 天、最新 3 版永不删除；如果你更想保留完整历史，把「保留天数」调大或关掉这个开关。
   重写历史意味着旧提交的 hash 会变，其它机器下次拉取会自动对齐（本插件每次拉取都 `reset --hard` 到远端）。
 - **恢复旧版本后不会再自动「回到最新」**：应用某一版旧快照后，本机内容就是那一版；再推送会把这一版落成新的远端提交。需要最新版时重新「检查远端 → 应用拉取」。
 
@@ -128,7 +140,8 @@ node --test test/core.test.mjs test/host.test.mjs
 ```
 
 测试不联网：round-trip 用本地裸仓库跑「推送 → 克隆 → 重映射 → 拉取 → 回滚」，
-host 测试用一个假 Cordis 上下文跑真实 `apply()`，验证 11 个 Remote 方法、6 个工具与服务行为。
+host 测试用一个假 Cordis 上下文跑真实 `apply()`，验证 12 个 Remote 方法、9 个工具与服务行为，
+以及「校验快照能发现被篡改的载荷」「远端保留既按天数又保底最新 N 版」两条闸门。
 
 ## 9. License
 

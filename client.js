@@ -77,6 +77,12 @@ window.__ModuleLoader__.load({
       planAdd: '{count} to add',
       planUpdate: '{count} to update',
       planSame: '{count} unchanged',
+      planDelta: 'Remote payload: +{added} new, {updated} rewritten (replaces {replaced} locally)',
+      verify: 'Verify snapshot',
+      verifyOk: 'Verified {checked} payload(s), {size} read back from the repository — all checksums match.',
+      verifyIssues: '{count} integrity problem(s) in this snapshot:',
+      verifyDrift: 'This machine differs from the snapshot in {count} file(s); a pull would rewrite them.',
+      verifyNoDrift: 'This machine already matches the snapshot.',
       mappings: 'Path mappings',
       mappingAuto: 'automatic',
       mappingManual: 'manual',
@@ -136,7 +142,8 @@ window.__ModuleLoader__.load({
       memoryDirHint: 'This is the storage directory of the memory plugin (memories.json + MEMORY.md), not another copy: it must point at the real store. Leave it empty to detect it from the installed memory plugin; a configured path that no longer exists is replaced by the detected one.',
       retentionEnable: 'Keep only recent remote versions',
       retentionDays: 'Days to keep',
-      retentionHint: 'After a successful push, snapshots older than this window are removed from the remote branch. The newest snapshot is always kept, even when it is itself older than the window. Other machines pick up the shorter history on their next pull.',
+      retentionKeepLast: 'Newest versions never pruned',
+      retentionHint: 'After a successful push, snapshots older than this window are removed from the remote branch. The newest {keepLast} versions are always kept, even when they are older than the window. Other machines pick up the shorter history on their next pull.',
       retentionLast: 'Last prune: {when} — removed {count} snapshot(s), window {days} day(s)',
     }
 
@@ -198,6 +205,12 @@ window.__ModuleLoader__.load({
       planAdd: '新增 {count}',
       planUpdate: '更新 {count}',
       planSame: '不变 {count}',
+      planDelta: '远端内容：新增 {added}，覆盖 {updated}（本机将替换 {replaced}）',
+      verify: '校验快照',
+      verifyOk: '已校验 {checked} 个文件、{size}，全部与清单一致。',
+      verifyIssues: '这一版有 {count} 处完整性问题：',
+      verifyDrift: '本机与快照有 {count} 个文件不同，拉取会覆盖它们。',
+      verifyNoDrift: '本机已经和这一版完全一致。',
       mappings: '路径映射',
       mappingAuto: '自动',
       mappingManual: '手动',
@@ -257,7 +270,8 @@ window.__ModuleLoader__.load({
       memoryDirHint: '这里就是记忆插件的存储目录（memories.json + MEMORY.md），不是另存一份：必须指向真实位置。留空会从已安装的记忆插件自动探测；已保存的路径如果不存在，会改用探测到的位置。',
       retentionEnable: '只保留最近若干天的远端版本',
       retentionDays: '保留天数',
-      retentionHint: '推送成功后，早于这个天数的快照会从远端分支里删除；最新的那一版始终保留，即使它本身已经超过天数。其它机器下次拉取时会拿到变短的历史。',
+      retentionKeepLast: '始终保留最新几版',
+      retentionHint: '推送成功后，早于这个天数的快照会从远端分支里删除；最新的 {keepLast} 版始终保留，即使它们本身已经超过天数。其它机器下次拉取时会拿到变短的历史。',
       retentionLast: '上次清理：{when}，删除 {count} 版，保留窗口 {days} 天',
     }
 
@@ -385,6 +399,8 @@ window.__ModuleLoader__.load({
       RollbackResult: strictCodec('RollbackResult'),
       HistoryRequest: strictCodec('HistoryRequest'),
       History: strictCodec('History'),
+      VerifyRequest: strictCodec('VerifyRequest'),
+      VerifyResult: strictCodec('VerifyResult'),
       InitRequest: strictCodec('InitRequest'),
       InitResult: strictCodec('InitResult'),
     }
@@ -414,6 +430,7 @@ window.__ModuleLoader__.load({
         descriptor('backups', 'BackupsRequest', 'BackupList'),
         descriptor('rollback', 'RollbackRequest', 'RollbackResult'),
         descriptor('history', 'HistoryRequest', 'History'),
+        descriptor('verify', 'VerifyRequest', 'VerifyResult'),
         descriptor('init', 'InitRequest', 'InitResult'),
       ],
     }
@@ -451,6 +468,7 @@ window.__ModuleLoader__.load({
       const [preview, setPreview] = React.useState(null)
       const [showFiles, setShowFiles] = React.useState(false)
       const [plan, setPlan] = React.useState(null)
+      const [verify, setVerify] = React.useState(null)
       const [confirmApply, setConfirmApply] = React.useState(false)
       const [backups, setBackups] = React.useState(null)
       const [history, setHistory] = React.useState(null)
@@ -577,8 +595,16 @@ window.__ModuleLoader__.load({
       })
       const doCheck = () => run('plan', () => api.pullPlan({}), (data) => {
         setPlan(data)
+        setVerify(null)
         setWarnings(Array.isArray(data.warnings) ? data.warnings : [])
         setConfirmApply(false)
+      })
+      const doVerify = () => run('verify', () => api.verify({ local: true }), (data) => {
+        setVerify(data)
+        setNotice(data.ok
+          ? t('verifyOk', { checked: data.checked, size: formatBytes(data.verifiedBytes) })
+          : t('verifyIssues', { count: data.issues.length }))
+        setWarnings(Array.isArray(data.warnings) ? data.warnings : [])
       })
       const finishApply = (result, buildNotice) => {
         if (result && result.applied) {
@@ -917,6 +943,38 @@ window.__ModuleLoader__.load({
       const planCounts = plan
         ? plan.actions.reduce((acc, row) => ({ ...acc, [row.action]: (acc[row.action] || 0) + 1 }), {})
         : {}
+      const planDelta = plan
+        ? plan.actions.reduce((acc, row) => {
+            if (row.action === 'add') acc.added += row.size || 0
+            if (row.action === 'update') {
+              acc.updated += row.size || 0
+              acc.replaced += row.localSize || 0
+            }
+            return acc
+          }, { added: 0, updated: 0, replaced: 0 })
+        : null
+      const verifyBlock = verify
+        ? h('div', { className: 'dsh-sync-field' },
+            h('p', { className: verify.ok ? 'dsh-sync-note' : 'dsh-sync-error' }, verify.ok
+              ? t('verifyOk', { checked: verify.checked, size: formatBytes(verify.verifiedBytes) })
+              : t('verifyIssues', { count: verify.issues.length })),
+            verify.snapshotId ? h('p', { className: 'dsh-sync-hint' }, `${t('remoteSnapshot', { id: verify.snapshotId })}${verify.createdAt ? ` · ${formatTime(verify.createdAt)}` : ''}`) : null,
+            verify.issues && verify.issues.length > 0
+              ? h('ul', { className: 'dsh-sync-list' }, verify.issues.slice(0, 10).map((row, index) =>
+                  h('li', { className: 'dsh-sync-item', key: index },
+                    h('span', { className: 'dsh-sync-item-text' },
+                      h('span', { className: 'dsh-sync-item-title' }, row.path),
+                      h('span', { className: 'dsh-sync-item-meta' }, row.problem),
+                    ),
+                  ),
+                ))
+              : null,
+            verify.drift && verify.drift.length > 0
+              ? h('p', { className: 'dsh-sync-hint' }, t('verifyDrift', { count: verify.drift.length }))
+              : h('p', { className: 'dsh-sync-hint' }, t('verifyNoDrift')),
+          )
+        : null
+
       const planBlock = plan
         ? h('div', { className: 'dsh-sync-field' },
             h('p', { className: 'dsh-sync-note' }, plan.remoteSnapshotId
@@ -924,6 +982,13 @@ window.__ModuleLoader__.load({
               : t('planEmpty')),
             plan.actions.length > 0
               ? h('p', { className: 'dsh-sync-hint' }, `${t('planAdd', { count: planCounts.add || 0 })} · ${t('planUpdate', { count: planCounts.update || 0 })} · ${t('planSame', { count: planCounts.same || 0 })}`)
+              : null,
+            planDelta && (planDelta.added > 0 || planDelta.updated > 0)
+              ? h('p', { className: 'dsh-sync-hint' }, t('planDelta', {
+                  added: formatBytes(planDelta.added),
+                  updated: formatBytes(planDelta.updated),
+                  replaced: formatBytes(planDelta.replaced),
+                }))
               : null,
             plan.skipped && plan.skipped.length > 0 ? h('p', { className: 'dsh-sync-hint' }, t('skipped', { count: plan.skipped.length })) : null,
             plan.mappings && plan.mappings.length > 0
@@ -970,8 +1035,10 @@ window.__ModuleLoader__.load({
           h('button', { type: 'button', className: 'dsh-sync-btn', disabled, onClick: () => void doPreview() }, t('preview')),
           h('button', { type: 'button', className: 'dsh-sync-btn dsh-sync-btn-primary', disabled: disabled || !current.configured, onClick: () => void doPush() }, t('push')),
           h('button', { type: 'button', className: 'dsh-sync-btn', disabled: disabled || !current.configured, onClick: () => void doCheck() }, t('checkRemote')),
+          h('button', { type: 'button', className: 'dsh-sync-btn', disabled: disabled || !current.configured, onClick: () => void doVerify() }, t('verify')),
           h('button', { type: 'button', className: 'dsh-sync-btn', disabled, onClick: () => void doBackup() }, t('backupNow')),
         ),
+        verifyBlock,
         previewBlock,
         planBlock,
       )
@@ -1083,7 +1150,19 @@ window.__ModuleLoader__.load({
             onChange: (event) => setForm({ ...form, remoteRetention: { ...(form.remoteRetention || {}), days: Number(event.target.value) || 3 } }),
           }),
         ),
-        h('p', { className: 'dsh-sync-hint' }, t('retentionHint')),
+        h('label', { className: 'dsh-sync-field' },
+          h('span', { className: 'dsh-sync-label' }, t('retentionKeepLast')),
+          h('input', {
+            className: 'dsh-sync-input',
+            type: 'number',
+            min: 1,
+            max: 50,
+            value: form.remoteRetention && form.remoteRetention.keepLast ? form.remoteRetention.keepLast : 3,
+            disabled,
+            onChange: (event) => setForm({ ...form, remoteRetention: { ...(form.remoteRetention || {}), keepLast: Number(event.target.value) || 3 } }),
+          }),
+        ),
+        h('p', { className: 'dsh-sync-hint' }, t('retentionHint', { keepLast: (form.remoteRetention && form.remoteRetention.keepLast) || 3 })),
         current.remoteRetention && current.remoteRetention.last
           ? h('p', { className: 'dsh-sync-hint' }, t('retentionLast', {
               when: formatTime(current.remoteRetention.last.at),
@@ -1200,6 +1279,7 @@ window.__ModuleLoader__.load({
           backups: () => callRemote('backups', {}),
           rollback: (request) => callRemote('rollback', request || {}),
           history: (request) => callRemote('history', request || {}),
+          verify: (request) => callRemote('verify', request || {}),
           init: (request) => callRemote('init', request || {}),
         }
 

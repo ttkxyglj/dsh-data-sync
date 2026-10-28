@@ -54,6 +54,7 @@ import {
   payloadDigest,
   planPull,
   rollbackTo,
+  verifySnapshot,
   writeSnapshotTree,
 } from './lib/snapshot.js'
 
@@ -309,7 +310,7 @@ function createRuntime(rawConfig) {
     }
   }
 
-  /** Prune remote snapshots older than the retention window (newest always kept). */
+  /** Prune remote snapshots older than the retention window (newest versions kept). */
   async function applyRetention(token) {
     const warnings = []
     if (!cfg.remoteRetention.enabled || cfg.repoUrl === '') return { warnings, pruned: 0, head: '' }
@@ -319,19 +320,40 @@ function createRuntime(rawConfig) {
     const lastAt = st.lastRetention && Number.isFinite(st.lastRetention.at) ? st.lastRetention.at : 0
     if (lastAt > 0 && Date.now() - lastAt < 10 * 60 * 1000) return { warnings, pruned: 0, head: '' }
     try {
-      const result = await pruneRemoteHistory(cfg, token, { days: cfg.remoteRetention.days })
+      const result = await pruneRemoteHistory(cfg, token, {
+        days: cfg.remoteRetention.days,
+        keepLast: cfg.remoteRetention.keepLast,
+      })
       if (result.pruned > 0) {
         const ids = result.snapshotIds.length > 0 ? ` (${result.snapshotIds.slice(0, 5).join(', ')})` : ''
-        warnings.push(`remote retention: removed ${result.pruned} snapshot(s) older than ${cfg.remoteRetention.days} day(s)${ids}; the newest one is always kept`)
+        warnings.push(
+          `remote retention: removed ${result.pruned} snapshot(s) outside the window (${cfg.remoteRetention.days} day(s), newest ${cfg.remoteRetention.keepLast} always kept)${ids}`,
+        )
         await log.append('info', `retention: pruned ${result.pruned} remote snapshot(s), kept ${result.kept}`)
         await state.patch({
-          lastRetention: { at: Date.now(), pruned: result.pruned, kept: result.kept, days: cfg.remoteRetention.days, head: result.head },
+          lastRetention: {
+            at: Date.now(),
+            pruned: result.pruned,
+            kept: result.kept,
+            days: cfg.remoteRetention.days,
+            keepLast: cfg.remoteRetention.keepLast,
+            head: result.head,
+          },
         })
       } else if (result.error) {
         warnings.push(`remote retention could not prune: ${result.error} — nothing was deleted`)
       }
       if (result.pruned === 0) {
-        await state.patch({ lastRetention: { at: Date.now(), pruned: 0, kept: result.kept, days: cfg.remoteRetention.days, head: result.head } })
+        await state.patch({
+          lastRetention: {
+            at: Date.now(),
+            pruned: 0,
+            kept: result.kept,
+            days: cfg.remoteRetention.days,
+            keepLast: cfg.remoteRetention.keepLast,
+            head: result.head,
+          },
+        })
       }
       return { warnings, pruned: result.pruned, head: result.head }
     } catch (error) {
@@ -393,6 +415,7 @@ function createRuntime(rawConfig) {
         remoteRetention: {
           enabled: cfg.remoteRetention.enabled,
           days: cfg.remoteRetention.days,
+          keepLast: cfg.remoteRetention.keepLast,
           last: st.lastRetention || null,
         },
         tokenPresent: token !== '',
@@ -719,6 +742,37 @@ function createRuntime(rawConfig) {
       }
     },
 
+    /**
+     * Check one snapshot for real: payload checksums against the manifest, the
+     * manifest digest against its own file list, and the drift between this
+     * machine and the snapshot. Read-only.
+     */
+    async verify(request) {
+      await ready()
+      return await exclusive(async () => {
+        const input = request && typeof request === 'object' ? request : {}
+        const { manifest, commit } = await loadRemote(input.commit)
+        if (!manifest) throw fail('NO_SNAPSHOT', 'the remote branch has no snapshot to verify yet')
+        const mappings = withOverrides(buildMappings(cfg, manifest), input.mappings)
+        const plan = await planPull(cfg, manifest, mappings)
+        const report = await verifySnapshot(cfg, manifest, mappings, plan)
+        // `local: true` also applies the snapshot in dry-run order to every file
+        // that differs, so a pull would be a no-op afterwards.
+        if (input.local === true && report.drift.length > 0) {
+          report.warnings = ['this machine differs from the snapshot; apply a pull to match it']
+        } else {
+          report.warnings = []
+        }
+        report.remoteCommit = commit
+        report.profile = manifest.profile || ''
+        if (manifest.profile && manifest.profile !== cfg.profile) {
+          report.warnings.push(`the snapshot was pushed from profile "${manifest.profile}", this machine runs "${cfg.profile}"`)
+        }
+        await log.append('info', `verify ${report.snapshotId}: ${report.checked} payload(s), ${report.issues.length} issue(s), ${report.drift.length} drifted`)
+        return report
+      })
+    },
+
     async init(request) {
       await ready()
       // Connecting writes config.json and resets the clone, so it belongs in the
@@ -811,6 +865,8 @@ const codecs = {
   RollbackResult: strictCodec('RollbackResult'),
   HistoryRequest: strictCodec('HistoryRequest'),
   History: strictCodec('History'),
+  VerifyRequest: strictCodec('VerifyRequest'),
+  VerifyResult: strictCodec('VerifyResult'),
   InitRequest: strictCodec('InitRequest'),
   InitResult: strictCodec('InitResult'),
 }
@@ -840,6 +896,7 @@ export const remoteContribution = {
     descriptor('backups', 'BackupsRequest', 'BackupList'),
     descriptor('rollback', 'RollbackRequest', 'RollbackResult'),
     descriptor('history', 'HistoryRequest', 'History'),
+    descriptor('verify', 'VerifyRequest', 'VerifyResult'),
     descriptor('init', 'InitRequest', 'InitResult'),
   ],
 }
@@ -851,8 +908,9 @@ const GUIDANCE = [
   '- A `@local/dsh-data-sync` plugin can snapshot this harness (profile config, memory store, skills) into a private git repository and restore it on another machine with absolute paths remapped.',
   '- Use `data_sync_status` before claiming anything about the sync state; `data_sync_push` writes a snapshot, `data_sync_pull` (apply: false) only previews what a pull would change.',
   '- `data_sync_pull` without `commit` applies the newest snapshot on the branch (for example the version pushed today); `data_sync_pull` with a `commit` from `data_sync_history` applies an older version instead.',
+  '- `data_sync_verify` re-reads every payload and checks it against the manifest, so "the backup is fine" is a claim with evidence instead of an assumption. Run it after a pull, before wiping a machine, or when a push was interrupted.',
   '- The `memoryDir` of this plugin is the storage directory of the memory plugin (its `storageDir`: `memories.json` + `MEMORY.md`), not a second copy. Never point it somewhere else; leave it empty to detect it from the installed memory plugin.',
-  '- Remote retention is on by default (3 days): a successful push prunes snapshots older than the window from the branch and always keeps the newest one. Set `remoteRetention` through `data_sync_configure` to change it.',
+  '- Remote retention is on by default (3 days, newest 3 versions always kept): a successful push prunes older snapshots from the branch. Set `remoteRetention` through `data_sync_configure` to change it.',
   '- Never invent a repository URL or token, and never enable "allow secrets": the snapshot deliberately excludes credentials.',
 ].join('\n')
 
@@ -874,6 +932,7 @@ const TOOL_TITLES = {
   data_sync_push: 'Push snapshot',
   data_sync_pull: 'Pull snapshot',
   data_sync_history: 'Snapshot history',
+  data_sync_verify: 'Verify snapshot',
   data_sync_backup: 'Back up now',
   data_sync_rollback: 'Roll back to backup',
 }
@@ -1006,10 +1065,11 @@ export function apply(ctx, rawConfig) {
           },
           remoteRetention: {
             type: 'object',
-            description: 'How many days of remote versions to keep. After a successful push, older snapshots are pruned from the branch history; the newest is always kept.',
+            description: 'How many days of remote versions to keep. After a successful push, snapshots outside the window are pruned from the branch history; the newest `keepLast` versions are always kept.',
             properties: {
               enabled: { type: 'boolean', description: 'Default true.' },
               days: { type: 'integer', minimum: 1, maximum: 365, description: 'Default 3.' },
+              keepLast: { type: 'integer', minimum: 1, maximum: 50, description: 'Newest versions that are never pruned, default 3.' },
             },
             additionalProperties: false,
           },
@@ -1114,6 +1174,27 @@ export function apply(ctx, rawConfig) {
       presentCall: presentCall(TOOL_TITLES.data_sync_history),
       async execute(args) {
         return await service.history(args || {})
+      },
+    }),
+  )
+
+  ctx.effect(() =>
+    ctx.tools.register({
+      name: 'data_sync_verify',
+      description:
+        'Verify a snapshot instead of trusting it: re-read every payload in the repository and check its checksum and size against the manifest, check the manifest digest against its own file list, and report the files that differ between this machine and that snapshot. Read-only. Run it after a pull, before wiping a machine, or after an interrupted push. Pass `commit` (from data_sync_history) to verify an older version.',
+      parameters: {
+        type: 'object',
+        properties: {
+          commit: { type: 'string', description: 'Optional commit hash from the remote history; verifies that snapshot instead of the branch head.' },
+          local: { type: 'boolean', description: 'Also report that this machine differs from the snapshot (the drift list is always included).' },
+        },
+        additionalProperties: false,
+      },
+      output: toolOutput(),
+      presentCall: presentCall(TOOL_TITLES.data_sync_verify),
+      async execute(args) {
+        return await service.verify(args || {})
       },
     }),
   )
