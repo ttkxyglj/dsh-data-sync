@@ -31,7 +31,9 @@ powershell -ExecutionPolicy Bypass -File .\dsh-data-sync\install.ps1 -Profile de
 # macOS / Linux: ./dsh-data-sync/install.sh desktop
 ```
 
-装完**重启 Harness**。换机恢复时，快照仓库里的 `bootstrap/dsh-data-sync/` 本来就是这份代码的副本，
+装完**重启 Harness**。`dsh plugin add` 除了让 pnpm 装上包，还会把 `@local/dsh-data-sync`
+登记进 profile 的 `dsh.profile.bundles`（已在本机用 `dsh --profile … --dump-config` 验证），
+所以不需要再手改 profile 配置。换机恢复时，快照仓库里的 `bootstrap/dsh-data-sync/` 本来就是这份代码的副本，
 所以即使没有网络，也能从快照仓库把插件装回来。
 
 ---
@@ -118,6 +120,8 @@ powershell -ExecutionPolicy Bypass -File ./dsh-sync-data/bootstrap/dsh-data-sync
 默认「应用拉取」恢复的就是**最新一版**（今天推的那版）；想恢复昨天/前天的版本，在**备份与历史**卡片里找到对应提交，
 点「应用此版本」——同样先备份本机。
 插件栈由 `cd ~/.dsh/profiles/desktop && pnpm install` 重建（`pnpm-lock.yaml` 已经跟着过来了）。
+如果旧机器上的插件是 `link:D:/…` 装的本地开发目录，新机器上那些路径不存在：把它们换成
+`github:ttkxyglj/dsh-data-sync#v0.5.0` 这样的规格（或重新 `dsh plugin add`）再 `pnpm install`。
 仓库根目录的 `BOOTSTRAP.md` 由每次推送自动重写，包含同一套步骤。
 
 ## 5. Agent 工具
